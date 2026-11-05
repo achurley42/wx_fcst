@@ -1,25 +1,113 @@
 # run_forecast.py
+import os
 import sys
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-# 1. Pre-Flight Dependency Verification (Runs before importing heavy packages)
+# 1. Pre-Flight Dependency Verification
 try:
     from dependency_check import check_and_install_dependencies
-    # Verify environment; prints status and auto-installs missing packages
     check_and_install_dependencies()
 except Exception as e:
     print(f"[WARN] Dependency check encountered an issue: {e}. Attempting standard run...")
 
-# 2. Main Application Imports
 from ingest_grib2 import load_and_regrid_grib2
 from model_architecture import HybridComputeManager, WeatherSpatioTemporalUNet
 from forecast_engine import run_hourly_72hr_forecast, export_hourly_deliverables
 
 
+def retrieve_cds_operational_analysis(bbox, target_date_utc, output_path):
+    """
+    Downloads a single T0 analysis timestamp via CDS API restricted to the user's bounding box.
+    """
+    try:
+        import cdsapi
+    except ImportError:
+        print("[ERROR] 'cdsapi' library is missing. Install with: pip install cdsapi")
+        sys.exit(1)
+
+    c = cdsapi.Client()
+    area = [bbox["lat_max"], bbox["lon_min"], bbox["lat_min"], bbox["lon_max"]]
+
+    year = f"{target_date_utc.year:04d}"
+    month = f"{target_date_utc.month:02d}"
+    day = f"{target_date_utc.day:02d}"
+    time_str = f"{target_date_utc.hour:02d}:00"
+
+    temp_sfc = output_path + ".sfc.tmp"
+    temp_pl = output_path + ".pl.tmp"
+
+    print("=" * 70)
+    print("  AUTOMATED OPERATIONAL CDS API RETRIEVAL (T0 ANALYSIS)")
+    print("=" * 70)
+    print(f"[CDS] Target Timestamp : {year}-{month}-{day} {time_str} UTC")
+    print(f"[CDS] Area Bounding Box: N={area[0]}, W={area[1]}, S={area[2]}, E={area[3]}")
+
+    print("[CDS] Pulling Surface Variables & Topography/LSM...")
+    c.retrieve(
+        "reanalysis-era5-single-levels",
+        {
+            "product_type": "reanalysis",
+            "format": "grib",
+            "variable": [
+                "2m_temperature",
+                "2m_dewpoint_temperature",
+                "10m_u_component_of_wind",
+                "10m_v_component_of_wind",
+                "mean_sea_level_pressure",
+                "total_precipitation",
+                "land_sea_mask",
+                "geopotential",
+            ],
+            "year": year,
+            "month": month,
+            "day": day,
+            "time": time_str,
+            "area": area,
+        },
+        temp_sfc
+    )
+
+    print("[CDS] Pulling Isobaric Levels (850, 700, 500, 250 hPa)...")
+    c.retrieve(
+        "reanalysis-era5-pressure-levels",
+        {
+            "product_type": "reanalysis",
+            "format": "grib",
+            "variable": [
+                "geopotential",
+                "temperature",
+                "specific_humidity",
+                "u_component_of_wind",
+                "v_component_of_wind",
+            ],
+            "pressure_level": ["250", "500", "700", "850"],
+            "year": year,
+            "month": month,
+            "day": day,
+            "time": time_str,
+            "area": area,
+        },
+        temp_pl
+    )
+
+    print(f"[CDS] Packaging combined operational GRIB2 analysis: {output_path}")
+    with open(output_path, "wb") as outfile:
+        with open(temp_sfc, "rb") as sfc_f:
+            outfile.write(sfc_f.read())
+        with open(temp_pl, "rb") as pl_f:
+            outfile.write(pl_f.read())
+
+    if os.path.exists(temp_sfc): os.remove(temp_sfc)
+    if os.path.exists(temp_pl): os.remove(temp_pl)
+    print(f"[SUCCESS] Download completed ({os.path.getsize(output_path)/1024/1024:.2f} MB).\n")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Standalone Hybrid GPU/CPU 72-Hour Hourly AI Weather Model")
-    parser.add_argument("--grib", type=str, default="input_blended.grib2", help="Path to input GRIB2 file")
+    parser.add_argument("--grib", type=str, default="input_analysis.grib2", help="Path to input GRIB2 file")
+    parser.add_argument("--use-cds", action="store_true", help="Automatically pull operational T0 analysis via CDS API")
+    parser.add_argument("--cds-date", type=str, default=None, help="Target UTC date for CDS pull (YYYY-MM-DD-HH). Defaults to 6 days ago (ERA5 release buffer)")
     parser.add_argument("--lat-min", type=float, required=True, help="Minimum Latitude")
     parser.add_argument("--lat-max", type=float, required=True, help="Maximum Latitude")
     parser.add_argument("--lon-min", type=float, required=True, help="Minimum Longitude")
@@ -42,6 +130,17 @@ def main():
         "lon_max": args.lon_max,
     }
 
+    # 1. Automated CDS API Ingestion Hook
+    if args.use_cds:
+        if args.cds_date:
+            target_time = datetime.strptime(args.cds_date, "%Y-%m-%d-%H").replace(tzinfo=timezone.utc)
+        else:
+            # ERA5 full reanalysis typically has a 5-day release buffer
+            target_time = (datetime.now(timezone.utc) - timedelta(days=6)).replace(minute=0, second=0, microsecond=0)
+
+        os.makedirs(os.path.dirname(os.path.abspath(args.grib)), exist_ok=True)
+        retrieve_cds_operational_analysis(bbox, target_time, args.grib)
+
     print("=" * 70)
     print("  AIR FORCE STANDALONE REGIONAL AI WEATHER MODEL (HOURLY ROLLOUT)")
     print("=" * 70)
@@ -50,13 +149,9 @@ def main():
     print(f"[CONFIG] Cadence      : 1 Hour (73 total states: T+00h to T+72h)")
     print(f"[CONFIG] Output Dir   : {args.outdir}")
 
-    # 1. Initialize Hybrid Hardware (CUDA GPU / MPS / CPU fallback)
     compute_mgr = HybridComputeManager(force_cpu=args.force_cpu)
-
-    # 2. Ingest GRIB2 & Regrid to Target Domain
     grid_data, lats, lons = load_and_regrid_grib2(args.grib, bbox, args.res)
 
-    # 3. Initialize Model & Execute Hourly Forecast
     model = WeatherSpatioTemporalUNet(in_channels=30, out_channels=6)
     init_time = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
 
@@ -70,7 +165,6 @@ def main():
         weights_path=args.weights
     )
 
-    # 4. Export Individual Hourly Files, Master NetCDF, CSV, and PNGs
     export_hourly_deliverables(
         history=history,
         lats=lats,
