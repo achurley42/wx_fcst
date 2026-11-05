@@ -3,11 +3,10 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
 
 class HybridComputeManager:
-    """Manages dynamic GPU/CPU selection, multi-threading, and OOM fallback."""
+    """Manages dynamic GPU/CPU selection, thread pools, and OOM fallback."""
     def __init__(self, force_cpu=False):
         self.device = self._select_optimal_device(force_cpu)
         self._configure_resources()
@@ -37,7 +36,7 @@ class HybridComputeManager:
             torch.backends.cudnn.benchmark = True
 
     def safe_forward(self, model, tensor_in):
-        """Executes forward pass on GPU; automatically falls back to CPU if CUDA OutOfMemory occurs."""
+        """Executes forward pass; automatically falls back to CPU if CUDA OOM occurs."""
         try:
             model = model.to(self.device)
             tensor_in = tensor_in.to(self.device)
@@ -50,7 +49,7 @@ class HybridComputeManager:
                     return model(tensor_in).cpu()
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
-                print("[WARN] GPU VRAM exceeded by high-res domain! Dynamically failing over to System RAM (CPU)...")
+                print("[WARN] GPU VRAM exceeded! Dynamically failing over to System RAM (CPU)...")
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 self.device = torch.device("cpu")
@@ -62,7 +61,6 @@ class HybridComputeManager:
 
 
 class ConvBlock(nn.Module):
-    """Double 3x3 Convolution with Circular/Replication boundary padding for regional domains."""
     def __init__(self, in_ch, out_ch):
         super().__init__()
         self.block = nn.Sequential(
@@ -79,11 +77,6 @@ class ConvBlock(nn.Module):
 
 
 class WeatherSpatioTemporalUNet(nn.Module):
-    """
-    Self-contained Regional AI Weather Model (U-Net Architecture).
-    Predicts 6-hour residuals for the 6 target surface variables conditioned on
-    upper-air steering, terrain elevation (orog), land-sea mask (lsm), and solar cycle.
-    """
     def __init__(self, in_channels=30, out_channels=6):
         super().__init__()
         self.enc1 = ConvBlock(in_channels, 32)
@@ -93,13 +86,11 @@ class WeatherSpatioTemporalUNet(nn.Module):
         self.dec1 = ConvBlock(64 + 32, 32)
         self.head = nn.Conv2d(32, out_channels, kernel_size=1)
 
-        # Initialize output head near zero so untrained/cold-start weights act as smooth residual modifiers
         nn.init.normal_(self.head.weight, mean=0.0, std=0.005)
         nn.init.zeros_(self.head.bias)
 
     def forward(self, x):
         orig_h, orig_w = x.shape[-2], x.shape[-1]
-        # Pad spatial dimensions to multiples of 4 for clean U-Net pooling
         pad_h = (4 - orig_h % 4) % 4
         pad_w = (4 - orig_w % 4) % 4
         if pad_h > 0 or pad_w > 0:
