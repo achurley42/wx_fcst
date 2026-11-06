@@ -14,7 +14,8 @@ REQUIRED_PACKAGES = {
     "matplotlib": "matplotlib",
     "netCDF4": "netCDF4",
     "cfgrib": "cfgrib",
-    "eccodes": "eccodes"
+    "eccodes": "eccodes",
+    "cdsapi": "cdsapi",
 }
 
 
