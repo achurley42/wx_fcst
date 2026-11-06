@@ -155,7 +155,7 @@ python run_forecast.py \
 ```
 
 ### 2. Fine-Tuned Model Inference
-Pass custom fine-tuned weights using the `--weights` flag:
+Pass custom fine-tuned weights using the `--weights` flag. If omitted, the driver checks `./checkpoints/calibration_registry.json` for an accepted 34-channel calibration from the matching hemisphere season whose bounding box covers at least 50% of the requested area.
 
 ```bash
 python run_forecast.py \
@@ -170,7 +170,24 @@ python run_forecast.py \
   --outdir ./forecast_output
 ```
 
-### 3. Synthetic Verification Run
+### 3. Historical Seasonal Calibration
+Download two complete years of six-hourly ERA5 and ERA5-Land data, train one model per meteorological season, and validate independent 72-hour rollouts against ERA5 at every six-hour lead:
+
+```bash
+python train_unet.py \
+  --use-cds \
+  --lat-min 25 --lat-max 35 \
+  --lon-min -90 --lon-max -80 \
+  --res 0.10
+```
+
+By default, the script uses the two most recent complete years, holds out the latest year, and runs up to five train/verify rounds per season. A season's weights are saved and added to `checkpoints/calibration_registry.json` only if all six atmospheric variables pass RMSE limits at every lead from T+06h through T+72h. Defaults are 3 K for temperature/dewpoint, 3 m/s for each wind component, 5 hPa for MSLP, and 3 mm for one-hour precipitation. Override with `--rmse-temperature-k`, `--rmse-wind-ms`, `--rmse-mslp-hpa`, and `--rmse-precip-mm`. Bias is reported but is not an independent acceptance gate. ERA5-Land fields are model inputs; this atmospheric-output model does not forecast or score soil states.
+
+Each calibration round trains for `--epochs` epochs (default 15); the latest year's early 70% of each season is used for iterative calibration checks, and later cases are reserved for final testing. Validation and test rollouts are separated by more than 72 hours to prevent their verification windows from overlapping. Regridded training frames use per-field offsets and scales in a temporary float16 disk-backed cache, avoiding overflow in high-magnitude fields while limiting RAM use; fine-resolution, large-area runs may need several GB of temporary disk space.
+
+If a season fails after the configured rounds, no weights are registered for it and the command reports failure. Increase the training history, adjust RMSE thresholds, or review the per-lead metrics before relying on a calibration.
+
+### 4. Synthetic Verification Run
 Omit `--grib` or pass an unlocated file path to test execution on standalone systems:
 
 ```bash
@@ -275,8 +292,9 @@ def run_hourly_72hr_forecast(grid_data, lats, lons, model, compute_mgr, start_ti
 
         x_tensor = torch.tensor(np.stack(channels, axis=0), dtype=torch.float32).unsqueeze(0)
 
-        # 3. Neural residual inference (scaled to 1-hour tendency)
-        nn_delta = compute_mgr.safe_forward(model, x_tensor).squeeze(0).numpy() / 6.0
+        # 3. Scale six-hour atmospheric tendencies; precipitation is a 1-hour amount.
+        nn_delta = compute_mgr.safe_forward(model, x_tensor).squeeze(0).numpy()
+        nn_delta[:5] /= 6.0
 
         # 4. Hourly physical advection shift
         prev_t2m = shift(history["t2m"][step - 1], shift=(shift_y, shift_x), mode="nearest")

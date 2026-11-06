@@ -1,9 +1,14 @@
 # get_historical_archive_cds.py
 import os
 import argparse
-from datetime import datetime, timedelta, timezone
+import calendar
 import cdsapi
 from ingest_grib2 import grib_has_era5_land_fields
+
+
+def _days_in_month(year, month):
+    return [f"{day:02d}" for day in range(1, calendar.monthrange(year, month)[1] + 1)]
+
 
 def download_historical_archive(bbox, start_year, end_year, output_dir):
     """
@@ -54,7 +59,7 @@ def download_historical_archive(bbox, start_year, end_year, output_dir):
                     ],
                     "year": yr,
                     "month": mo,
-                    "day": [f"{d:02d}" for d in range(1, 32)],
+                    "day": _days_in_month(int(yr), int(mo)),
                     "time": times,
                     "area": area,
                 },
@@ -77,7 +82,7 @@ def download_historical_archive(bbox, start_year, end_year, output_dir):
                     "pressure_level": ["250", "500", "700", "850"],
                     "year": yr,
                     "month": mo,
-                    "day": [f"{d:02d}" for d in range(1, 32)],
+                    "day": _days_in_month(int(yr), int(mo)),
                     "time": times,
                     "area": area,
                 },
@@ -99,7 +104,7 @@ def download_historical_archive(bbox, start_year, end_year, output_dir):
                     ],
                     "year": yr,
                     "month": mo,
-                    "day": [f"{d:02d}" for d in range(1, 32)],
+                    "day": _days_in_month(int(yr), int(mo)),
                     "time": times,
                     "area": area,
                 },

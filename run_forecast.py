@@ -12,6 +12,7 @@ except Exception as e:
     print(f"[WARN] Dependency check encountered an issue: {e}. Attempting standard run...")
 
 from ingest_grib2 import ERA5_LAND_ALIASES, load_and_regrid_grib2
+from calibration_registry import find_compatible_calibration, season_for_time
 from model_architecture import (
     MODEL_INPUT_CHANNELS,
     HybridComputeManager,
@@ -183,6 +184,12 @@ def parse_args():
     parser.add_argument("--lon-max", type=float, required=True, help="Maximum Longitude")
     parser.add_argument("--res", type=float, default=0.10, help="Target spatial resolution in degrees")
     parser.add_argument("--weights", type=str, default=None, help="Optional path to fine-tuned .pt weights")
+    parser.add_argument(
+        "--calibration-registry",
+        type=str,
+        default="./checkpoints/calibration_registry.json",
+        help="Regional/seasonal calibrated-weight registry",
+    )
     parser.add_argument("--plot-interval", type=int, default=1, help="Interval in hours for prognostic charts (e.g. 1, 6, 12)")
     parser.add_argument("--force-cpu", action="store_true", help="Force execution on CPU")
     parser.add_argument("--skip-dep-check", action="store_true", help="Bypass pre-flight dependency checker")
@@ -229,6 +236,24 @@ def main():
 
     model = WeatherSpatioTemporalUNet(in_channels=MODEL_INPUT_CHANNELS, out_channels=6)
     init_time = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    weights_path = args.weights
+    if weights_path is None:
+        season = season_for_time(init_time, (args.lat_min + args.lat_max) / 2.0)
+        match = find_compatible_calibration(
+            args.calibration_registry, bbox, season, minimum_overlap=0.5
+        )
+        if match:
+            calibration, overlap = match
+            weights_path = calibration["weights_path"]
+            print(
+                f"[MODEL] Reusing {season} calibration from "
+                f"{calibration['bbox']} (region overlap {overlap:.0%}): {weights_path}"
+            )
+        else:
+            print(
+                f"[MODEL] No {season} calibration overlaps this region by at least 50%; "
+                "using baseline weights."
+            )
 
     history, valid_times = run_hourly_72hr_forecast(
         grid_data=grid_data,
@@ -237,7 +262,7 @@ def main():
         model=model,
         compute_mgr=compute_mgr,
         start_time_utc=init_time,
-        weights_path=args.weights
+        weights_path=weights_path
     )
 
     export_hourly_deliverables(

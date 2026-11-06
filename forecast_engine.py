@@ -35,7 +35,7 @@ def run_hourly_72hr_forecast(grid_data, lats, lons, model, compute_mgr, start_ti
     num_steps = 73
     history = {k: np.zeros((num_steps, nlat, nlon), dtype=np.float32) for k in SURFACE_KEYS}
     for k in SURFACE_KEYS:
-        history[k][0] = grid_data[k]
+        history[k][0] = grid_data[k] * 1000.0 if k == "tp" else grid_data[k]
 
     valid_times = [start_time_utc + timedelta(hours=step) for step in range(num_steps)]
 
@@ -89,8 +89,9 @@ def run_hourly_72hr_forecast(grid_data, lats, lons, model, compute_mgr, start_ti
             )
         x_tensor = torch.tensor(np.stack(channels, axis=0), dtype=torch.float32).unsqueeze(0)
 
-        # 3. Neural residual inference (scaled to 1-hour tendency)
-        nn_delta = compute_mgr.safe_forward(model, x_tensor).squeeze(0).numpy() / 6.0
+        # 3. Scale six-hour atmospheric tendencies; precipitation is a 1-hour amount.
+        nn_delta = compute_mgr.safe_forward(model, x_tensor).squeeze(0).numpy()
+        nn_delta[:5] /= 6.0
 
         # 4. Hourly physical advection shift
         prev_t2m = shift(history["t2m"][step - 1], shift=(shift_y, shift_x), mode="nearest")

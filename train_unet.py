@@ -3,19 +3,23 @@ import os
 import sys
 import glob
 import argparse
+import shutil
+import tempfile
+import weakref
 from datetime import datetime, timedelta, timezone
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset, Subset
 from scipy.ndimage import shift
 
+from calibration_registry import SEASONS, save_calibration, season_for_time
 from ingest_grib2 import (
     ERA5_LAND_KEYS,
     UPPER_AIR_KEYS,
     generate_synthetic_grid,
     grib_has_era5_land_fields,
-    load_and_regrid_grib2,
+    load_and_regrid_grib2_sequence,
 )
 from model_architecture import (
     MODEL_INPUT_CHANNELS,
@@ -25,6 +29,52 @@ from model_architecture import (
 )
 
 SURFACE_KEYS = ["t2m", "d2m", "u10", "v10", "msl", "tp"]
+RMSE_THRESHOLDS = {
+    "t2m": 3.0,
+    "d2m": 3.0,
+    "u10": 3.0,
+    "v10": 3.0,
+    "msl": 5.0,
+    "tp": 3.0,
+}
+GRID_FRAME_KEYS = (
+    tuple(SURFACE_KEYS)
+    + tuple(UPPER_AIR_KEYS)
+    + ("orog", "lsm")
+    + tuple(ERA5_LAND_KEYS)
+)
+
+
+class _MappedGridFrame:
+    def __init__(self, mapped_frames, frame_index, offsets, scales):
+        self.mapped_frames = mapped_frames
+        self.frame_index = frame_index
+        self.offsets = offsets
+        self.scales = scales
+
+    def __getitem__(self, key):
+        channel = GRID_FRAME_KEYS.index(key)
+        values = np.asarray(
+            self.mapped_frames[self.frame_index, channel], dtype=np.float32
+        )
+        return values * self.scales[channel] + self.offsets[channel]
+
+    def get(self, key, default=None):
+        if key not in GRID_FRAME_KEYS:
+            return default
+        return self[key]
+
+
+def _cleanup_frame_cache(mapped_frames, cache_dir):
+    for mapped in mapped_frames:
+        mapped._mmap.close()
+    shutil.rmtree(cache_dir)
+
+
+def _days_in_month(year, month):
+    import calendar
+
+    return [f"{day:02d}" for day in range(1, calendar.monthrange(year, month)[1] + 1)]
 
 
 def retrieve_cds_historical_archive(bbox, start_year, end_year, output_dir):
@@ -83,7 +133,7 @@ def retrieve_cds_historical_archive(bbox, start_year, end_year, output_dir):
                     ],
                     "year": yr,
                     "month": mo,
-                    "day": [f"{d:02d}" for d in range(1, 32)],
+                    "day": _days_in_month(int(yr), int(mo)),
                     "time": times,
                     "area": area,
                 },
@@ -106,7 +156,7 @@ def retrieve_cds_historical_archive(bbox, start_year, end_year, output_dir):
                     "pressure_level": ["250", "500", "700", "850"],
                     "year": yr,
                     "month": mo,
-                    "day": [f"{d:02d}" for d in range(1, 32)],
+                    "day": _days_in_month(int(yr), int(mo)),
                     "time": times,
                     "area": area,
                 },
@@ -127,7 +177,7 @@ def retrieve_cds_historical_archive(bbox, start_year, end_year, output_dir):
                     ],
                     "year": yr,
                     "month": mo,
-                    "day": [f"{d:02d}" for d in range(1, 32)],
+                    "day": _days_in_month(int(yr), int(mo)),
                     "time": times,
                     "area": area,
                 },
@@ -152,22 +202,94 @@ class HistoricalGribDataset(Dataset):
         super().__init__()
         self.bbox = bbox
         self.target_res = target_res
-        self.grib_files = sorted(glob.glob(os.path.join(grib_dir, "*.grib*")) +
-                                 glob.glob(os.path.join(grib_dir, "*.grb*")))
-
+        self.grib_files = sorted({
+            path
+            for path in (
+                glob.glob(os.path.join(grib_dir, "*.grib*"))
+                + glob.glob(os.path.join(grib_dir, "*.grb*"))
+            )
+            if not os.path.basename(path).startswith(
+                ("era5_sfc_", "era5_pl_", "era5_land_")
+            )
+            and not path.endswith((".sfc.tmp", ".pl.tmp", ".land.tmp"))
+        })
         self.frames = []
         self.timestamps = []
         base_time = datetime(2025, 1, 1, 0, 0, tzinfo=timezone.utc)
+        cache_dir = tempfile.mkdtemp(prefix="wx_fcst_training_frames-")
+        mapped_frames = []
+        weakref.finalize(self, _cleanup_frame_cache, mapped_frames, cache_dir)
 
-        if len(self.grib_files) >= 2:
-            print(f"[DATASET] Ingesting {len(self.grib_files)} historical GRIB2 files from '{grib_dir}'...")
-            for idx, fpath in enumerate(self.grib_files):
-                grid_data, self.lats, self.lons = load_and_regrid_grib2(fpath, bbox, target_res)
-                self.frames.append(grid_data)
-                self.timestamps.append(base_time + timedelta(hours=6 * idx))
-        else:
+        if self.grib_files:
+            print(f"[DATASET] Ingesting historical GRIB2 time series from '{grib_dir}'...")
+            records = []
+            for file_index, fpath in enumerate(self.grib_files):
+                file_frames, self.lats, self.lons = load_and_regrid_grib2_sequence(
+                    fpath, bbox, target_res
+                )
+                file_frames = [
+                    (timestamp, grid_data)
+                    for timestamp, grid_data in file_frames
+                    if timestamp is not None
+                ]
+                if not file_frames:
+                    continue
+                offsets = np.empty(len(GRID_FRAME_KEYS), dtype=np.float32)
+                scales = np.empty(len(GRID_FRAME_KEYS), dtype=np.float32)
+                for channel_index, key in enumerate(GRID_FRAME_KEYS):
+                    channel_min = min(
+                        float(np.min(grid_data[key]))
+                        for _, grid_data in file_frames
+                    )
+                    channel_max = max(
+                        float(np.max(grid_data[key]))
+                        for _, grid_data in file_frames
+                    )
+                    offsets[channel_index] = (channel_min + channel_max) / 2.0
+                    scales[channel_index] = max(
+                        1.0,
+                        max(
+                            abs(channel_min - offsets[channel_index]),
+                            abs(channel_max - offsets[channel_index]),
+                        ) / 60000.0,
+                    )
+                cache_path = os.path.join(cache_dir, f"frames_{file_index:04d}.npy")
+                mapped = np.lib.format.open_memmap(
+                    cache_path,
+                    mode="w+",
+                    dtype=np.float16,
+                    shape=(
+                        len(file_frames),
+                        len(GRID_FRAME_KEYS),
+                        len(self.lats),
+                        len(self.lons),
+                    ),
+                )
+                for frame_index, (timestamp, grid_data) in enumerate(file_frames):
+                    for channel_index, key in enumerate(GRID_FRAME_KEYS):
+                        mapped[frame_index, channel_index] = (
+                            grid_data[key] - offsets[channel_index]
+                        ) / scales[channel_index]
+                    records.append(
+                        (
+                            timestamp,
+                            _MappedGridFrame(mapped, frame_index, offsets, scales),
+                        )
+                    )
+                mapped.flush()
+                mapped_frames.append(mapped)
+                del file_frames
+            records.sort(key=lambda record: record[0])
+            self.timestamps = [
+                timestamp.replace(tzinfo=timezone.utc) for timestamp, _ in records
+            ]
+            self.frames = [grid_data for _, grid_data in records]
+
+        if len(self.frames) < 2:
             print(f"[DATASET] Insufficient GRIB files found in '{grib_dir}'. Generating synthetic sequence for validation...")
             base_grid, self.lats, self.lons = generate_synthetic_grid(bbox, target_res)
+            self.frames = []
+            self.timestamps = []
             for step in range(num_synthetic_steps):
                 vtime = base_time + timedelta(hours=6 * step)
                 self.timestamps.append(vtime)
@@ -177,6 +299,14 @@ class HistoricalGribDataset(Dataset):
         self.nlon = len(self.lons)
         self.lon_grid, self.lat_grid = np.meshgrid(self.lons, self.lats)
         self.dx_meters = abs(self.lats[1] - self.lats[0]) * 111000.0 if self.nlat > 1 else 11100.0
+        self.sample_frame_indices = [
+            idx
+            for idx in range(len(self.frames) - 1)
+            if self.timestamps[idx + 1] - self.timestamps[idx] == timedelta(hours=6)
+        ]
+        self.frame_index_by_time = {
+            timestamp: idx for idx, timestamp in enumerate(self.timestamps)
+        }
 
     def _evolve_synthetic_state(self, base_grid, step, vtime):
         state = {k: v.copy() for k, v in base_grid.items()}
@@ -197,12 +327,13 @@ class HistoricalGribDataset(Dataset):
         return state
 
     def __len__(self):
-        return len(self.frames) - 1
+        return len(self.sample_frame_indices)
 
     def __getitem__(self, idx):
-        curr_grid = self.frames[idx]
-        next_grid = self.frames[idx + 1]
-        vtime_next = self.timestamps[idx + 1]
+        frame_idx = self.sample_frame_indices[idx]
+        curr_grid = self.frames[frame_idx]
+        next_grid = self.frames[frame_idx + 1]
+        vtime_next = self.timestamps[frame_idx + 1]
 
         orog = curr_grid["orog"]
         lsm = curr_grid["lsm"]
@@ -256,7 +387,7 @@ class HistoricalGribDataset(Dataset):
             (next_grid["u10"] - base_u10) / 0.4,
             (next_grid["v10"] - base_v10) / 0.4,
             (next_grid["msl"] - base_msl) / 50.0,
-            next_grid["tp"]
+            next_grid["tp"] * 1000.0
         ], axis=0).astype(np.float32)
 
         y_tensor = torch.tensor(target_delta, dtype=torch.float32)
@@ -282,7 +413,156 @@ class PhysicsInformedWeatherLoss(nn.Module):
         return mse_loss + physics_penalty
 
 
+def _sample_target_time(dataset, sample_index):
+    frame_index = dataset.sample_frame_indices[sample_index]
+    return dataset.timestamps[frame_index + 1]
+
+
+def _select_rollout_starts(dataset, season, latitude, latest_year):
+    candidates = []
+    for frame_index, start_time in enumerate(dataset.timestamps):
+        if start_time.year != latest_year or season_for_time(start_time, latitude) != season:
+            continue
+        lead_times = [
+            start_time + timedelta(hours=lead)
+            for lead in range(6, 73, 6)
+        ]
+        if all(timestamp in dataset.frame_index_by_time for timestamp in lead_times):
+            candidates.append(frame_index)
+
+    return candidates
+
+
+def _split_rollout_starts(candidates, timestamps, validation_fraction=0.7):
+    split_index = max(1, int(len(candidates) * validation_fraction))
+    if split_index >= len(candidates):
+        return candidates, []
+    first_test_start = candidates[split_index]
+    validation_candidates = [
+        candidate for candidate in candidates[:split_index]
+        if timestamps[candidate] + timedelta(hours=72) < timestamps[first_test_start]
+    ]
+    return validation_candidates, candidates[split_index:]
+
+
+def _spread_rollout_starts(candidates, max_runs):
+    if not candidates:
+        return []
+    positions = np.linspace(
+        0, len(candidates) - 1, num=min(max_runs, len(candidates))
+    ).round().astype(int)
+    return [candidates[position] for position in positions]
+
+
+def _evaluate_rollouts(model, dataset, start_indices, compute_mgr, thresholds):
+    from forecast_engine import run_hourly_72hr_forecast
+
+    totals = {
+        lead: {
+            key: {"squared_error": 0.0, "error": 0.0, "count": 0}
+            for key in thresholds
+        }
+        for lead in range(6, 73, 6)
+    }
+    model.eval()
+
+    for start_index in start_indices:
+        start_grid = dataset.frames[start_index]
+        start_time = dataset.timestamps[start_index]
+        forecast, _ = run_hourly_72hr_forecast(
+            grid_data=start_grid,
+            lats=dataset.lats,
+            lons=dataset.lons,
+            model=model,
+            compute_mgr=compute_mgr,
+            start_time_utc=start_time,
+        )
+        for lead in range(6, 73, 6):
+            valid_time = start_time + timedelta(hours=lead)
+            truth = dataset.frames[dataset.frame_index_by_time[valid_time]]
+            prediction_index = lead
+            for key in thresholds:
+                predicted = forecast[key][prediction_index]
+                observed = truth[key]
+                if key == "tp":
+                    observed = observed * 1000.0
+                elif key == "msl":
+                    predicted = predicted / 100.0
+                    observed = observed / 100.0
+                difference = np.asarray(predicted, dtype=np.float64) - np.asarray(
+                    observed, dtype=np.float64
+                )
+                finite = np.isfinite(difference)
+                totals[lead][key]["squared_error"] += float(np.sum(difference[finite] ** 2))
+                totals[lead][key]["error"] += float(np.sum(difference[finite]))
+                totals[lead][key]["count"] += int(np.count_nonzero(finite))
+
+    metrics = {}
+    accepted = bool(start_indices)
+    for lead, variables in totals.items():
+        metrics[str(lead)] = {}
+        for key, sums in variables.items():
+            if sums["count"] == 0:
+                rmse = bias = float("inf")
+                accepted = False
+            else:
+                rmse = (sums["squared_error"] / sums["count"]) ** 0.5
+                bias = sums["error"] / sums["count"]
+                if rmse > thresholds[key]:
+                    accepted = False
+            metrics[str(lead)][key] = {"rmse": rmse, "bias": bias}
+            print(
+                f"[VERIFY] T+{lead:02d}h {key}: RMSE={rmse:.3f} "
+                f"(limit {thresholds[key]:.3f}), bias={bias:.3f}"
+            )
+    return metrics, accepted
+
+
+def _train_calibration_round(model, train_loader, optimizer, criterion, device, epochs):
+    use_amp = device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    loss_sum = 0.0
+    sample_count = 0
+
+    for _ in range(epochs):
+        model.train()
+        for x_batch, y_batch, base_td_batch in train_loader:
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
+            base_td_batch = base_td_batch.to(device)
+            optimizer.zero_grad()
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                prediction = model(x_batch)
+                loss = criterion(prediction, y_batch, base_td_batch)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            loss_sum += loss.item() * x_batch.size(0)
+            sample_count += x_batch.size(0)
+
+    return loss_sum / max(1, sample_count)
+
+
 def train_model(args):
+    if args.max_calibration_rounds < 1:
+        raise ValueError("--max-calibration-rounds must be at least 1")
+    if args.epochs < 1:
+        raise ValueError("--epochs must be at least 1")
+    if args.validation_runs < 1 or args.test_runs < 1:
+        raise ValueError("--validation-runs and --test-runs must be at least 1")
+    if any(
+        not np.isfinite(value) or value <= 0
+        for value in (
+            args.rmse_temperature_k,
+            args.rmse_wind_ms,
+            args.rmse_mslp_hpa,
+            args.rmse_precip_mm,
+        )
+    ):
+        raise ValueError("All RMSE thresholds must be finite positive values.")
+
     bbox = {
         "lat_min": args.lat_min,
         "lat_max": args.lat_max,
@@ -290,106 +570,225 @@ def train_model(args):
         "lon_max": args.lon_max,
     }
 
-    # Automated Historical CDS Archive Pull Hook
     if args.use_cds:
         retrieve_cds_historical_archive(bbox, args.start_year, args.end_year, args.grib_dir)
 
     print("=" * 70)
-    print("  HYBRID GPU/CPU REGIONAL AI WEATHER MODEL TRAINING PIPELINE")
+    print("  SEASONAL REGIONAL FORECAST CALIBRATION")
     print("=" * 70)
 
     compute_mgr = HybridComputeManager(force_cpu=args.force_cpu)
     device = compute_mgr.device
-
     dataset = HistoricalGribDataset(args.grib_dir, bbox, args.res)
-    n_total = len(dataset)
-    n_val = max(1, int(0.2 * n_total))
-    n_train = n_total - n_val
-    train_ds, val_ds = torch.utils.data.random_split(dataset, [n_train, n_val])
+    if not len(dataset):
+        raise ValueError("No consecutive six-hour historical frames are available for training.")
 
+    latitude = (args.lat_min + args.lat_max) / 2.0
+    latest_year = max(timestamp.year for timestamp in dataset.timestamps)
     batch_size = args.batch_size if device.type == "cuda" else min(args.batch_size, 2)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
-
-    model = WeatherSpatioTemporalUNet(in_channels=MODEL_INPUT_CHANNELS, out_channels=6).to(device)
-    if args.resume_weights and os.path.exists(args.resume_weights):
-        print(f"[TRAIN] Resuming checkpoint: {args.resume_weights}")
-        load_compatible_state_dict(model, torch.load(args.resume_weights, map_location=device))
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     criterion = PhysicsInformedWeatherLoss(dataset.lats, device)
-    use_amp = (device.type == "cuda")
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-
-    best_val_loss = float("inf")
+    thresholds = {
+        "t2m": args.rmse_temperature_k,
+        "d2m": args.rmse_temperature_k,
+        "u10": args.rmse_wind_ms,
+        "v10": args.rmse_wind_ms,
+        "msl": args.rmse_mslp_hpa,
+        "tp": args.rmse_precip_mm,
+    }
     os.makedirs(os.path.dirname(os.path.abspath(args.save_weights)), exist_ok=True)
 
-    print(f"[TRAIN] Epochs: {args.epochs} | Train: {n_train} | Val: {n_val} | Device: {device}")
+    failures = []
+    for season in SEASONS:
+        train_indices = [
+            index for index in range(len(dataset))
+            if _sample_target_time(dataset, index).year < latest_year
+            and season_for_time(_sample_target_time(dataset, index), latitude) == season
+        ]
+        rollout_candidates = _select_rollout_starts(
+            dataset, season, latitude, latest_year
+        )
+        validation_pool, test_pool = _split_rollout_starts(
+            rollout_candidates, dataset.timestamps
+        )
+        validation_starts = _spread_rollout_starts(
+            validation_pool, args.validation_runs
+        )
+        test_starts = _spread_rollout_starts(test_pool, args.test_runs)
+        if not train_indices or not validation_starts or not test_starts:
+            print(
+                f"[WARN] Skipping {season}: need training samples before {latest_year} "
+                "plus distinct calibration-validation and final-test 72-hour cases "
+                "in that year."
+            )
+            failures.append(season)
+            continue
 
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        train_loss_sum = 0.0
-        for x_batch, y_batch, base_td_batch in train_loader:
-            x_batch = x_batch.to(device)
-            y_batch = y_batch.to(device)
-            base_td_batch = base_td_batch.to(device)
+        print(
+            f"[CALIBRATE] {season}: {len(train_indices)} training transitions, "
+            f"{len(validation_starts)} held-out rollouts from {latest_year}."
+        )
+        train_loader = DataLoader(
+            Subset(dataset, train_indices),
+            batch_size=batch_size,
+            shuffle=True,
+        )
+        model = WeatherSpatioTemporalUNet(
+            in_channels=MODEL_INPUT_CHANNELS, out_channels=6
+        ).to(device)
+        if args.resume_weights and os.path.exists(args.resume_weights):
+            print(f"[TRAIN] Initializing from checkpoint: {args.resume_weights}")
+            load_compatible_state_dict(
+                model, torch.load(args.resume_weights, map_location=device)
+            )
 
-            optimizer.zero_grad()
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                pred = model(x_batch)
-                loss = criterion(pred, y_batch, base_td_batch)
+        learning_rate = args.lr
+        accepted = False
+        validation_metrics = {}
+        test_metrics = {}
+        for round_number in range(1, args.max_calibration_rounds + 1):
+            optimizer = torch.optim.AdamW(
+                model.parameters(), lr=learning_rate, weight_decay=1e-4
+            )
+            train_loss = _train_calibration_round(
+                model, train_loader, optimizer, criterion, device, args.epochs
+            )
+            print(
+                f"[CALIBRATE] {season} round {round_number}/"
+                f"{args.max_calibration_rounds}: training loss={train_loss:.5f}"
+            )
+            validation_metrics, validation_passed = _evaluate_rollouts(
+                model, dataset, validation_starts, compute_mgr, thresholds
+            )
+            if validation_passed:
+                print(f"[TEST] Running independent final holdout for {season}.")
+                test_metrics, accepted = _evaluate_rollouts(
+                    model, dataset, test_starts, compute_mgr, thresholds
+                )
+                if not accepted:
+                    print(
+                        f"[REJECTED] {season} passed calibration validation but failed "
+                        "the independent final holdout; no weights were registered."
+                    )
+                    break
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+                base, extension = os.path.splitext(args.save_weights)
+                weights_path = os.path.abspath(f"{base}_{season}{extension or '.pt'}")
+                torch.save(model.state_dict(), weights_path)
+                save_calibration(
+                    args.calibration_registry,
+                    {
+                        "season": season,
+                        "bbox": bbox,
+                        "weights_path": weights_path,
+                        "validation_year": latest_year,
+                        "history_years": sorted({time.year for time in dataset.timestamps}),
+                        "validation_rollouts": len(validation_starts),
+                        "test_rollouts": len(test_starts),
+                        "rmse_thresholds": thresholds,
+                        "validation_metrics": validation_metrics,
+                        "test_metrics": test_metrics,
+                        "input_channels": MODEL_INPUT_CHANNELS,
+                    },
+                )
+                print(
+                    f"[ACCEPTED] {season} weights saved and registered: {weights_path}"
+                )
+                break
+            learning_rate *= 0.5
+            print(
+                f"[CALIBRATE] {season} missed at least one lead/variable threshold; "
+                f"reducing learning rate to {learning_rate:.3g} and retraining."
+            )
 
-            train_loss_sum += loss.item() * x_batch.size(0)
+        if not accepted:
+            failures.append(season)
+            print(
+                f"[REJECTED] {season} did not pass all RMSE checks; "
+                "no weights were registered."
+            )
 
-        scheduler.step()
-        avg_train_loss = train_loss_sum / n_train
-
-        model.eval()
-        val_loss_sum = 0.0
-        with torch.no_grad():
-            for x_val, y_val, base_td_val in val_loader:
-                x_val = x_val.to(device)
-                y_val = y_val.to(device)
-                base_td_val = base_td_val.to(device)
-                pred_val = model(x_val)
-                v_loss = criterion(pred_val, y_val, base_td_val)
-                val_loss_sum += v_loss.item() * x_val.size(0)
-
-        avg_val_loss = val_loss_sum / n_val
-        status_tag = ""
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), args.save_weights)
-            status_tag = " --> [SAVED BEST CHECKPOINT]"
-
-        print(f"  Epoch [{epoch:02d}/{args.epochs:02d}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}{status_tag}")
-
-    print("=" * 70)
-    print(f"[COMPLETE] Model saved to: {args.save_weights}")
+    if failures:
+        raise RuntimeError(
+            "Seasonal calibration incomplete for: "
+            + ", ".join(failures)
+            + ". No unverified weights were added for those seasons."
+        )
+    print(f"[COMPLETE] Accepted calibrations are recorded in {args.calibration_registry}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train/Fine-Tune Regional AI Weather U-Net on GRIB2 Archives")
     parser.add_argument("--grib-dir", type=str, default="./historical_grib2", help="Directory of 6-hourly GRIB2 files")
     parser.add_argument("--use-cds", action="store_true", help="Download historical archive automatically via CDS API")
-    parser.add_argument("--start-year", type=int, default=2023, help="Start year for CDS historical archive")
-    parser.add_argument("--end-year", type=int, default=2023, help="End year for CDS historical archive")
+    parser.add_argument(
+        "--start-year",
+        type=int,
+        default=datetime.now(timezone.utc).year - 2,
+        help="First year of the default two complete years of historical data",
+    )
+    parser.add_argument(
+        "--end-year",
+        type=int,
+        default=datetime.now(timezone.utc).year - 1,
+        help="Last year of the default two complete years of historical data",
+    )
     parser.add_argument("--lat-min", type=float, required=True, help="Minimum Latitude")
     parser.add_argument("--lat-max", type=float, required=True, help="Maximum Latitude")
     parser.add_argument("--lon-min", type=float, required=True, help="Minimum Longitude")
     parser.add_argument("--lon-max", type=float, required=True, help="Maximum Longitude")
     parser.add_argument("--res", type=float, default=0.10, help="Target spatial resolution in degrees")
     parser.add_argument("--epochs", type=int, default=15, help="Number of training epochs")
+    parser.add_argument(
+        "--max-calibration-rounds",
+        type=int,
+        default=5,
+        help="Maximum train-and-verify rounds per season",
+    )
+    parser.add_argument(
+        "--validation-runs",
+        type=int,
+        default=4,
+        help="Maximum independent 72-hour validation rollouts per season",
+    )
+    parser.add_argument(
+        "--test-runs",
+        type=int,
+        default=2,
+        help="Maximum separate final 72-hour test rollouts per season",
+    )
+    parser.add_argument(
+        "--rmse-temperature-k",
+        type=float,
+        default=RMSE_THRESHOLDS["t2m"],
+        help="Maximum T+06h...T+72h temperature/dewpoint RMSE in kelvin",
+    )
+    parser.add_argument(
+        "--rmse-wind-ms",
+        type=float,
+        default=RMSE_THRESHOLDS["u10"],
+        help="Maximum 10 m wind-component RMSE in m/s",
+    )
+    parser.add_argument(
+        "--rmse-mslp-hpa",
+        type=float,
+        default=RMSE_THRESHOLDS["msl"],
+        help="Maximum mean sea-level pressure RMSE in hPa",
+    )
+    parser.add_argument(
+        "--rmse-precip-mm",
+        type=float,
+        default=RMSE_THRESHOLDS["tp"],
+        help="Maximum 1-hour precipitation RMSE in mm at each six-hour checkpoint",
+    )
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size (auto-throttled on CPU)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate")
     parser.add_argument("--save-weights", type=str, default="./checkpoints/regional_unet_best.pt", help="Path for trained weights")
+    parser.add_argument(
+        "--calibration-registry",
+        type=str,
+        default="./checkpoints/calibration_registry.json",
+        help="JSON registry for accepted regional and seasonal weights",
+    )
     parser.add_argument("--resume-weights", type=str, default=None, help="Checkpoint to resume fine-tuning")
     parser.add_argument("--force-cpu", action="store_true", help="Force training on CPU")
     train_model(parser.parse_args())

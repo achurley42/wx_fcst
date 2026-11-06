@@ -44,30 +44,71 @@ ERA5_LAND_ALIASES = tuple(frozenset(aliases) for aliases in ERA5_LAND_VARS.value
 
 
 def grib_has_era5_land_fields(grib_path):
-    import cfgrib
-
-    datasets = cfgrib.open_datasets(grib_path)
+    datasets = []
     try:
+        datasets = _open_grib_datasets(grib_path)
+        if not datasets:
+            print(f"[WARN] No readable GRIB datasets found in {grib_path}.")
+            return False
         available_vars = set().union(*(dataset.data_vars for dataset in datasets))
         return all(available_vars.intersection(aliases) for aliases in ERA5_LAND_ALIASES)
+    except Exception as exc:
+        print(f"[WARN] Could not verify ERA5-Land fields in {grib_path}: {exc}")
+        return False
     finally:
         for dataset in datasets:
             dataset.close()
 
 
-def _extract_var(ds_list, alias_list, exclude_dims=()):
+def _extract_var(ds_list, alias_list, exclude_dims=(), valid_time=None):
     for ds in ds_list:
         for alias in alias_list:
             if alias in ds.data_vars:
                 da = ds[alias]
-                if not any(dim in da.dims for dim in exclude_dims):
+                if (
+                    not any(dim in da.dims for dim in exclude_dims)
+                    and _has_valid_time(da, valid_time)
+                ):
                     return da
     return None
 
 
-def _regrid_field(da, lat_name, lon_name, target_lats, target_lons, var_name):
+def _has_valid_time(da, valid_time):
+    if valid_time is None:
+        return True
+    for coord_name in ("valid_time", "time"):
+        if coord_name in da.coords:
+            values = np.asarray(da.coords[coord_name].values).astype("datetime64[ns]")
+            return bool(np.any(values == np.datetime64(valid_time, "ns")))
+    return "time" not in da.dims
+
+
+def _select_valid_time(da, valid_time):
+    if valid_time is None:
+        if "time" in da.dims:
+            return da.isel(time=-1)
+        return da
+
+    for coord_name in ("valid_time", "time"):
+        if coord_name in da.coords:
+            coord = da.coords[coord_name]
+            values = np.asarray(coord.values).astype("datetime64[ns]")
+            matches = np.flatnonzero(values.reshape(-1) == np.datetime64(valid_time, "ns"))
+            if matches.size:
+                indices = np.unravel_index(matches[0], values.shape)
+                indexers = {
+                    dim: int(index)
+                    for dim, index in zip(coord.dims, indices)
+                    if dim in da.dims
+                }
+                return da.isel(indexers)
     if "time" in da.dims:
-        da = da.isel(time=-1)
+        raise ValueError(f"GRIB field does not contain requested valid time {valid_time}")
+    return da
+
+
+def _regrid_field(da, lat_name, lon_name, target_lats, target_lons, var_name, valid_time=None):
+    da = _select_valid_time(da, valid_time)
 
     for dim in [dim for dim in da.dims if dim not in (lat_name, lon_name)]:
         if da.sizes[dim] != 1:
@@ -98,19 +139,20 @@ def _regrid_field(da, lat_name, lon_name, target_lats, target_lons, var_name):
     return values
 
 
-def load_and_regrid_grib2(grib_path, bbox, target_res):
-    """
-    Ingests GRIB2, crops to bounding box, and interpolates to target resolution.
-    Falls back to synthetic grid if the file is missing or eccodes fails.
-    """
-    print(f"[INGEST] Loading GRIB2 file: {grib_path}")
-    try:
-        import cfgrib
-        ds_list = cfgrib.open_datasets(grib_path)
-    except Exception as e:
-        print(f"[WARN] Could not open {grib_path} ({e}). Generating synthetic operational grid for standalone testing...")
-        return generate_synthetic_grid(bbox, target_res)
+def _available_valid_times(ds_list):
+    for aliases in SURFACE_VARS.values():
+        da = _extract_var(ds_list, aliases)
+        if da is None:
+            continue
+        for coord_name in ("valid_time", "time"):
+            if coord_name in da.coords:
+                values = np.asarray(da.coords[coord_name].values).astype("datetime64[ns]")
+                values = values[~np.isnat(values)]
+                return np.unique(values.reshape(-1))
+    return np.array([], dtype="datetime64[ns]")
 
+
+def _regrid_datasets(ds_list, bbox, target_res, valid_time=None):
     target_lats = np.arange(bbox["lat_min"], bbox["lat_max"] + target_res / 2, target_res)
     target_lons = np.arange(bbox["lon_min"], bbox["lon_max"] + target_res / 2, target_res)
 
@@ -127,19 +169,28 @@ def load_and_regrid_grib2(grib_path, bbox, target_res):
     regridded_data = {}
 
     for std_name, aliases in SURFACE_VARS.items():
-        da = _extract_var(ds_list, aliases)
+        da = _extract_var(ds_list, aliases, valid_time=valid_time)
         if da is not None:
             regridded_data[std_name] = _regrid_field(
-                da, lat_name, lon_name, target_lats, target_lons, std_name
+                da, lat_name, lon_name, target_lats, target_lons, std_name, valid_time
             )
         else:
+            if valid_time is not None:
+                raise ValueError(
+                    f"Historical GRIB frame {valid_time} is missing required field {std_name}"
+                )
             regridded_data[std_name] = _default_field(std_name, len(target_lats), len(target_lons))
 
     for std_name, aliases in STATIC_VARS.items():
-        da = _extract_var(ds_list, aliases, exclude_dims=("isobaricInhPa",))
+        da = _extract_var(
+            ds_list,
+            aliases,
+            exclude_dims=("isobaricInhPa",),
+            valid_time=valid_time,
+        )
         if da is not None:
             vals = _regrid_field(
-                da, lat_name, lon_name, target_lats, target_lons, std_name
+                da, lat_name, lon_name, target_lats, target_lons, std_name, valid_time
             )
             if std_name == "orog" and np.nanmax(vals) > 9000:
                 vals = vals / 9.80665
@@ -148,30 +199,94 @@ def load_and_regrid_grib2(grib_path, bbox, target_res):
             regridded_data[std_name] = _default_field(std_name, len(target_lats), len(target_lons))
 
     for std_name, aliases in ERA5_LAND_VARS.items():
-        da = _extract_var(ds_list, aliases)
+        da = _extract_var(ds_list, aliases, valid_time=valid_time)
         if da is not None:
             regridded_data[std_name] = _regrid_field(
-                da, lat_name, lon_name, target_lats, target_lons, std_name
+                da, lat_name, lon_name, target_lats, target_lons, std_name, valid_time
             )
         else:
+            if valid_time is not None:
+                raise ValueError(
+                    f"Historical GRIB frame {valid_time} is missing ERA5-Land field {std_name}"
+                )
             regridded_data[std_name] = _default_field(
                 std_name, len(target_lats), len(target_lons)
             )
 
     for std_name, aliases in UPPER_AIR_VARS.items():
-        da = _extract_var(ds_list, aliases)
+        da = _extract_var(ds_list, aliases, valid_time=valid_time)
         for plev in REQUIRED_PLEVS:
             key_name = f"{std_name}_{plev}"
             if da is not None and "isobaricInhPa" in da.coords:
                 if plev in da["isobaricInhPa"].values:
                     da_plev = da.sel(isobaricInhPa=plev)
                     regridded_data[key_name] = _regrid_field(
-                        da_plev, lat_name, lon_name, target_lats, target_lons, key_name
+                        da_plev,
+                        lat_name,
+                        lon_name,
+                        target_lats,
+                        target_lons,
+                        key_name,
+                        valid_time,
                     )
                     continue
             regridded_data[key_name] = _default_field(key_name, len(target_lats), len(target_lons))
 
     return regridded_data, target_lats, target_lons
+
+
+def _open_grib_datasets(grib_path):
+    import cfgrib
+
+    return cfgrib.open_datasets(grib_path)
+
+
+def load_and_regrid_grib2_sequence(grib_path, bbox, target_res):
+    print(f"[INGEST] Loading GRIB2 time sequence: {grib_path}")
+    try:
+        ds_list = _open_grib_datasets(grib_path)
+    except Exception as e:
+        print(f"[WARN] Could not open {grib_path} ({e}). Using one synthetic frame.")
+        grid_data, lats, lons = generate_synthetic_grid(bbox, target_res)
+        return [(None, grid_data)], lats, lons
+
+    try:
+        valid_times = _available_valid_times(ds_list)
+        if not valid_times.size:
+            grid_data, lats, lons = _regrid_datasets(ds_list, bbox, target_res)
+            return [(None, grid_data)], lats, lons
+
+        frames = []
+        lats = lons = None
+        for valid_time in valid_times:
+            grid_data, lats, lons = _regrid_datasets(
+                ds_list, bbox, target_res, valid_time
+            )
+            frame_time = valid_time.astype("datetime64[us]").astype(object)
+            frames.append((frame_time, grid_data))
+        return frames, lats, lons
+    finally:
+        for dataset in ds_list:
+            dataset.close()
+
+
+def load_and_regrid_grib2(grib_path, bbox, target_res):
+    """
+    Ingests GRIB2, crops to bounding box, and interpolates to target resolution.
+    Falls back to synthetic grid if the file is missing or eccodes fails.
+    """
+    print(f"[INGEST] Loading GRIB2 file: {grib_path}")
+    try:
+        ds_list = _open_grib_datasets(grib_path)
+    except Exception as e:
+        print(f"[WARN] Could not open {grib_path} ({e}). Generating synthetic operational grid for standalone testing...")
+        return generate_synthetic_grid(bbox, target_res)
+
+    try:
+        return _regrid_datasets(ds_list, bbox, target_res)
+    finally:
+        for dataset in ds_list:
+            dataset.close()
 
 
 def _default_field(var_name, nlat, nlon):
@@ -205,7 +320,15 @@ def generate_synthetic_grid(bbox, target_res):
     msl = 101325.0 - 800.0 * np.exp(-((lon_grid - np.mean(target_lons))**2 + (lat_grid - np.mean(target_lats))**2) / 15.0)
     u10 = 6.0 + 3.0 * np.cos(lat_grid * 0.2) * (1.0 - 0.3 * lsm)
     v10 = 2.5 * np.sin(lon_grid * 0.3)
-    tp = np.clip(2.0 * np.exp(-((lon_grid - np.mean(target_lons))**2 + (lat_grid - np.mean(target_lats))**2) / 8.0), 0, 25)
+    tp = np.clip(
+        2.0
+        * np.exp(
+            -((lon_grid - np.mean(target_lons))**2 + (lat_grid - np.mean(target_lats))**2)
+            / 8.0
+        ),
+        0,
+        25,
+    ) / 1000.0
 
     data = {
         "t2m": t2m,
