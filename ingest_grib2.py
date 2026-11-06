@@ -39,6 +39,28 @@ def _extract_var(ds_list, alias_list):
     return None
 
 
+def _regrid_field(da, lat_name, lon_name, target_lats, target_lons, var_name):
+    if "time" in da.dims:
+        da = da.isel(time=-1)
+
+    for dim in [dim for dim in da.dims if dim not in (lat_name, lon_name)]:
+        if da.sizes[dim] != 1:
+            raise ValueError(
+                f"Cannot regrid {var_name}: unexpected non-spatial dimension "
+                f"{dim!r} has size {da.sizes[dim]}"
+            )
+        da = da.isel({dim: 0}, drop=True)
+
+    da_interp = da.interp({lat_name: target_lats, lon_name: target_lons}, method="linear")
+    values = da_interp.transpose(lat_name, lon_name).values
+    expected_shape = (len(target_lats), len(target_lons))
+    if values.shape != expected_shape:
+        raise ValueError(
+            f"Cannot regrid {var_name}: expected shape {expected_shape}, got {values.shape}"
+        )
+    return values
+
+
 def load_and_regrid_grib2(grib_path, bbox, target_res):
     """
     Ingests GRIB2, crops to bounding box, and interpolates to target resolution.
@@ -70,20 +92,18 @@ def load_and_regrid_grib2(grib_path, bbox, target_res):
     for std_name, aliases in SURFACE_VARS.items():
         da = _extract_var(ds_list, aliases)
         if da is not None:
-            if "time" in da.dims and da.sizes["time"] > 1:
-                da = da.isel(time=-1)
-            da_interp = da.interp({lat_name: target_lats, lon_name: target_lons}, method="linear")
-            regridded_data[std_name] = da_interp.values
+            regridded_data[std_name] = _regrid_field(
+                da, lat_name, lon_name, target_lats, target_lons, std_name
+            )
         else:
             regridded_data[std_name] = _default_field(std_name, len(target_lats), len(target_lons))
 
     for std_name, aliases in STATIC_VARS.items():
         da = _extract_var(ds_list, aliases)
         if da is not None:
-            if "time" in da.dims and da.sizes["time"] > 1:
-                da = da.isel(time=-1)
-            da_interp = da.interp({lat_name: target_lats, lon_name: target_lons}, method="linear")
-            vals = da_interp.values
+            vals = _regrid_field(
+                da, lat_name, lon_name, target_lats, target_lons, std_name
+            )
             if std_name == "orog" and np.nanmax(vals) > 9000:
                 vals = vals / 9.80665
             regridded_data[std_name] = vals
@@ -97,10 +117,9 @@ def load_and_regrid_grib2(grib_path, bbox, target_res):
             if da is not None and "isobaricInhPa" in da.coords:
                 if plev in da["isobaricInhPa"].values:
                     da_plev = da.sel(isobaricInhPa=plev)
-                    if "time" in da_plev.dims and da_plev.sizes["time"] > 1:
-                        da_plev = da_plev.isel(time=-1)
-                    da_interp = da_plev.interp({lat_name: target_lats, lon_name: target_lons}, method="linear")
-                    regridded_data[key_name] = da_interp.values
+                    regridded_data[key_name] = _regrid_field(
+                        da_plev, lat_name, lon_name, target_lats, target_lons, key_name
+                    )
                     continue
             regridded_data[key_name] = _default_field(key_name, len(target_lats), len(target_lons))
 
