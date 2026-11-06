@@ -10,8 +10,19 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from scipy.ndimage import shift
 
-from ingest_grib2 import load_and_regrid_grib2, generate_synthetic_grid
-from model_architecture import HybridComputeManager, WeatherSpatioTemporalUNet
+from ingest_grib2 import (
+    ERA5_LAND_KEYS,
+    UPPER_AIR_KEYS,
+    generate_synthetic_grid,
+    grib_has_era5_land_fields,
+    load_and_regrid_grib2,
+)
+from model_architecture import (
+    MODEL_INPUT_CHANNELS,
+    HybridComputeManager,
+    WeatherSpatioTemporalUNet,
+    load_compatible_state_dict,
+)
 
 SURFACE_KEYS = ["t2m", "d2m", "u10", "v10", "msl", "tp"]
 
@@ -44,12 +55,15 @@ def retrieve_cds_historical_archive(bbox, start_year, end_year, output_dir):
     for yr in years:
         for mo in months:
             merged_file = os.path.join(output_dir, f"era5_train_{yr}_{mo}.grib2")
-            if os.path.exists(merged_file):
+            if os.path.exists(merged_file) and grib_has_era5_land_fields(merged_file):
                 print(f"[SKIP] Archive {merged_file} already exists on disk.")
                 continue
+            if os.path.exists(merged_file):
+                print(f"[CDS] Existing archive lacks ERA5-Land fields; refreshing {merged_file}.")
 
             temp_sfc = merged_file + ".sfc.tmp"
             temp_pl = merged_file + ".pl.tmp"
+            temp_land = merged_file + ".land.tmp"
 
             print(f"\n[CDS] Fetching Surface & Terrain for {yr}-{mo}...")
             c.retrieve(
@@ -99,12 +113,35 @@ def retrieve_cds_historical_archive(bbox, start_year, end_year, output_dir):
                 temp_pl
             )
 
-            with open(merged_file, "wb") as outfile:
-                with open(temp_sfc, "rb") as f1: outfile.write(f1.read())
-                with open(temp_pl, "rb") as f2: outfile.write(f2.read())
+            print(f"[CDS] Fetching ERA5-Land fields for {yr}-{mo}...")
+            c.retrieve(
+                "reanalysis-era5-land",
+                {
+                    "product_type": "reanalysis",
+                    "format": "grib",
+                    "variable": [
+                        "skin_temperature",
+                        "soil_temperature_level_1",
+                        "volumetric_soil_water_layer_1",
+                        "snow_cover",
+                    ],
+                    "year": yr,
+                    "month": mo,
+                    "day": [f"{d:02d}" for d in range(1, 32)],
+                    "time": times,
+                    "area": area,
+                },
+                temp_land
+            )
 
-            if os.path.exists(temp_sfc): os.remove(temp_sfc)
-            if os.path.exists(temp_pl): os.remove(temp_pl)
+            with open(merged_file, "wb") as outfile:
+                for temp_path in (temp_sfc, temp_pl, temp_land):
+                    with open(temp_path, "rb") as data_file:
+                        outfile.write(data_file.read())
+
+            for temp_path in (temp_sfc, temp_pl, temp_land):
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
             print(f"[CDS] Saved combined training segment: {merged_file}")
 
     print("\n[SUCCESS] CDS Historical Archive Download Finished.\n")
@@ -181,14 +218,19 @@ class HistoricalGribDataset(Dataset):
         for k in SURFACE_KEYS:
             arr = curr_grid[k]
             channels.append((arr - np.mean(arr)) / (np.std(arr) + 1e-5))
-        for k in [key for key in curr_grid.keys() if "_" in key]:
+        for k in UPPER_AIR_KEYS:
             arr = curr_grid[k]
             channels.append((arr - np.mean(arr)) / (np.std(arr) + 1e-5))
         channels.extend([orog_norm, lsm, diurnal_wave, np.sin(np.deg2rad(self.lat_grid)).astype(np.float32)])
-        while len(channels) < 30:
-            channels.append(np.zeros_like(orog_norm))
+        for k in ERA5_LAND_KEYS:
+            arr = curr_grid[k]
+            channels.append((arr - np.mean(arr)) / (np.std(arr) + 1e-5))
 
-        x_tensor = torch.tensor(np.stack(channels[:30], axis=0), dtype=torch.float32)
+        if len(channels) != MODEL_INPUT_CHANNELS:
+            raise ValueError(
+                f"Expected {MODEL_INPUT_CHANNELS} model input channels, got {len(channels)}"
+            )
+        x_tensor = torch.tensor(np.stack(channels, axis=0), dtype=torch.float32)
 
         u_steer = curr_grid.get("u_850", curr_grid["u10"] * 1.5)
         v_steer = curr_grid.get("v_850", curr_grid["v10"] * 1.5)
@@ -269,10 +311,10 @@ def train_model(args):
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
-    model = WeatherSpatioTemporalUNet(in_channels=30, out_channels=6).to(device)
+    model = WeatherSpatioTemporalUNet(in_channels=MODEL_INPUT_CHANNELS, out_channels=6).to(device)
     if args.resume_weights and os.path.exists(args.resume_weights):
         print(f"[TRAIN] Resuming checkpoint: {args.resume_weights}")
-        model.load_state_dict(torch.load(args.resume_weights, map_location=device))
+        load_compatible_state_dict(model, torch.load(args.resume_weights, map_location=device))
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)

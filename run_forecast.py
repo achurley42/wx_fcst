@@ -11,8 +11,12 @@ try:
 except Exception as e:
     print(f"[WARN] Dependency check encountered an issue: {e}. Attempting standard run...")
 
-from ingest_grib2 import load_and_regrid_grib2
-from model_architecture import HybridComputeManager, WeatherSpatioTemporalUNet
+from ingest_grib2 import ERA5_LAND_ALIASES, load_and_regrid_grib2
+from model_architecture import (
+    MODEL_INPUT_CHANNELS,
+    HybridComputeManager,
+    WeatherSpatioTemporalUNet,
+)
 from forecast_engine import run_hourly_72hr_forecast, export_hourly_deliverables
 
 
@@ -36,6 +40,7 @@ def retrieve_cds_operational_analysis(bbox, target_date_utc, output_path):
 
     temp_sfc = output_path + ".sfc.tmp"
     temp_pl = output_path + ".pl.tmp"
+    temp_land = output_path + ".land.tmp"
 
     print("=" * 70)
     print("  AUTOMATED OPERATIONAL CDS API RETRIEVAL (T0 ANALYSIS)")
@@ -91,15 +96,36 @@ def retrieve_cds_operational_analysis(bbox, target_date_utc, output_path):
         temp_pl
     )
 
-    print(f"[CDS] Packaging combined operational GRIB2 analysis: {output_path}")
-    with open(output_path, "wb") as outfile:
-        with open(temp_sfc, "rb") as sfc_f:
-            outfile.write(sfc_f.read())
-        with open(temp_pl, "rb") as pl_f:
-            outfile.write(pl_f.read())
+    print("[CDS] Pulling ERA5-Land skin, soil, moisture, and snow fields...")
+    c.retrieve(
+        "reanalysis-era5-land",
+        {
+            "product_type": "reanalysis",
+            "format": "grib",
+            "variable": [
+                "skin_temperature",
+                "soil_temperature_level_1",
+                "volumetric_soil_water_layer_1",
+                "snow_cover",
+            ],
+            "year": year,
+            "month": month,
+            "day": day,
+            "time": time_str,
+            "area": area,
+        },
+        temp_land
+    )
 
-    if os.path.exists(temp_sfc): os.remove(temp_sfc)
-    if os.path.exists(temp_pl): os.remove(temp_pl)
+    print(f"[CDS] Packaging combined ERA5 and ERA5-Land GRIB2 analysis: {output_path}")
+    with open(output_path, "wb") as outfile:
+        for temp_path in (temp_sfc, temp_pl, temp_land):
+            with open(temp_path, "rb") as data_file:
+                outfile.write(data_file.read())
+
+    for temp_path in (temp_sfc, temp_pl, temp_land):
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
     print(f"[SUCCESS] Download completed ({os.path.getsize(output_path)/1024/1024:.2f} MB).\n")
 
 
@@ -133,6 +159,10 @@ def existing_cds_data_matches_time(grib_path, target_time_utc):
                     f"{target_time_utc.strftime('%Y-%m-%d %H:%M UTC')}: {grib_path}"
                 )
                 return False
+        available_vars = set().union(*(dataset.data_vars for dataset in datasets))
+        if not all(available_vars.intersection(aliases) for aliases in ERA5_LAND_ALIASES):
+            print(f"[CDS] Existing GRIB is missing ERA5-Land fields: {grib_path}")
+            return False
         return True
     except Exception as exc:
         print(f"[CDS] Could not verify existing GRIB data ({exc}); downloading again.")
@@ -197,7 +227,7 @@ def main():
     compute_mgr = HybridComputeManager(force_cpu=args.force_cpu)
     grid_data, lats, lons = load_and_regrid_grib2(args.grib, bbox, args.res)
 
-    model = WeatherSpatioTemporalUNet(in_channels=30, out_channels=6)
+    model = WeatherSpatioTemporalUNet(in_channels=MODEL_INPUT_CHANNELS, out_channels=6)
     init_time = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
 
     history, valid_times = run_hourly_72hr_forecast(

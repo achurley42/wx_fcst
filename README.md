@@ -38,6 +38,7 @@ The architecture employs a **Physics-Guided Neural Hybrid Architecture**: it run
 |                  ingest_grib2.py (Ingestion & Regridding)                |
 |  - Dynamically subsets to user Bounding Box [lat_min, lat_max, etc.]     |
 |  - Interpolates to user-defined resolution (e.g., 0.05 deg / ~5.5 km)    |
+|  - Regrids ERA5-Land skin/soil temperature, moisture, and snow |
 |  - Static field extraction: Orography (orog/z) & Land-Sea Mask (lsm)     |
 |  - Upper-air isobaric extraction (850, 700, 500, 250 hPa)                |
 +------------------------------------+-------------------------------------+
@@ -47,7 +48,7 @@ The architecture employs a **Physics-Guided Neural Hybrid Architecture**: it run
 |               model_architecture.py (Compute & Core Model)               |
 |  - HybridComputeManager: CUDA GPU -> Apple Silicon MPS -> Multi-Core CPU |
 |  - Dynamic CPU OOM fallback if VRAM is exceeded by high resolution       |
-|  - WeatherSpatioTemporalUNet: 30-channel input -> 6 surface tendencies   |
+|  - WeatherSpatioTemporalUNet: 34-channel input -> 6 surface tendencies |
 +------------------------------------+-------------------------------------+
                                      |
                                      v
@@ -131,6 +132,9 @@ The pipeline ingests initial background states directly from standard WMO GRIB2 
 - **Surface Variables:** 2m Temperature (`t2m`), 2m Dewpoint (`d2m`), 10m Wind components (`u10`, `v10`), Mean Sea Level Pressure (`msl`), and Total Precipitation (`tp`).
 - **Static Boundary Data:** Orography/Geopotential (`orog` or `z`) and Land-Sea Mask (`lsm`).
 - **Upper-Air Isobaric Wind/Moisture (850, 700, 500, 250 hPa):** Geopotential height (`z`), temperature (`t`), humidity (`q`), and wind fields (`u`, `v`).
+- **ERA5-Land Coupling:** Skin temperature, top-layer soil temperature, top-layer volumetric soil water, and snow cover. `--use-cds` retrieves these alongside ERA5; GRIB inputs without them use neutral defaults.
+
+The model uses 34 input channels, retaining the existing ERA5 atmospheric inputs and adding four ERA5-Land fields. Existing 30-channel checkpoints are accepted with zero-initialized weights for the new channels; fine-tuning with ERA5-Land archives is recommended to learn their effects.
 
 ---
 
@@ -251,12 +255,12 @@ def run_hourly_72hr_forecast(grid_data, lats, lons, model, compute_mgr, start_ti
         prev_diurnal = np.cos((prev_solar_hr - 14.0) * 2.0 * np.pi / 24.0).astype(np.float32)
         diurnal_delta = diurnal_wave - prev_diurnal
 
-        # 2. Assemble 30-channel input tensor
+        # 2. Assemble atmospheric and ERA5-Land input channels
         channels = []
         for k in SURFACE_KEYS:
             arr = history[k][step - 1]
             channels.append((arr - np.mean(arr)) / (np.std(arr) + 1e-5))
-        for k in [key for key in grid_data.keys() if "_" in key]:
+        for k in UPPER_AIR_KEYS:
             arr = grid_data[k]
             channels.append((arr - np.mean(arr)) / (np.std(arr) + 1e-5))
         channels.extend([
@@ -265,11 +269,11 @@ def run_hourly_72hr_forecast(grid_data, lats, lons, model, compute_mgr, start_ti
             diurnal_wave,
             np.sin(np.deg2rad(lat_grid)).astype(np.float32)
         ])
+        for k in ERA5_LAND_KEYS:
+            arr = grid_data[k]
+            channels.append((arr - np.mean(arr)) / (np.std(arr) + 1e-5))
 
-        while len(channels) < 30:
-            channels.append(np.zeros_like(orog_norm))
-
-        x_tensor = torch.tensor(np.stack(channels[:30], axis=0), dtype=torch.float32).unsqueeze(0)
+        x_tensor = torch.tensor(np.stack(channels, axis=0), dtype=torch.float32).unsqueeze(0)
 
         # 3. Neural residual inference (scaled to 1-hour tendency)
         nn_delta = compute_mgr.safe_forward(model, x_tensor).squeeze(0).numpy() / 6.0
@@ -498,7 +502,7 @@ def main():
     grid_data, lats, lons = load_and_regrid_grib2(args.grib, bbox, args.res)
 
     # 3. Initialize Model & Execute Hourly Forecast
-    model = WeatherSpatioTemporalUNet(in_channels=30, out_channels=6)
+    model = WeatherSpatioTemporalUNet(in_channels=34, out_channels=6)
     init_time = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
 
     history, valid_times = run_hourly_72hr_forecast(

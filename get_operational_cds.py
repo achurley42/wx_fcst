@@ -21,6 +21,7 @@ def download_operational_analysis(bbox, target_date_utc, output_file):
     
     temp_sfc = "temp_sfc.grib"
     temp_pl = "temp_pl.grib"
+    temp_land = "temp_land.grib"
 
     print("=" * 70)
     print("  OPERATIONAL ERA5 DATA RETRIEVAL (CDS API)")
@@ -78,17 +79,39 @@ def download_operational_analysis(bbox, target_date_utc, output_file):
         temp_pl
     )
 
-    # 3. Concatenate GRIB messages into a unified file
-    print(f"[CDS] Merging surface and upper-air GRIB messages into: {output_file}")
+    # 3. Download ERA5-Land surface and soil fields
+    print("[CDS] Requesting ERA5-Land skin, soil, moisture, and snow fields...")
+    c.retrieve(
+        "reanalysis-era5-land",
+        {
+            "product_type": "reanalysis",
+            "format": "grib",
+            "variable": [
+                "skin_temperature",
+                "soil_temperature_level_1",
+                "volumetric_soil_water_layer_1",
+                "snow_cover",
+            ],
+            "year": year,
+            "month": month,
+            "day": day,
+            "time": time_str,
+            "area": area,
+        },
+        temp_land
+    )
+
+    # 4. Concatenate GRIB messages into a unified file
+    print(f"[CDS] Merging ERA5 surface, upper-air, and ERA5-Land GRIB messages into: {output_file}")
     with open(output_file, "wb") as outfile:
-        with open(temp_sfc, "rb") as sfc_f:
-            outfile.write(sfc_f.read())
-        with open(temp_pl, "rb") as pl_f:
-            outfile.write(pl_f.read())
+        for temp_path in (temp_sfc, temp_pl, temp_land):
+            with open(temp_path, "rb") as data_file:
+                outfile.write(data_file.read())
 
     # Cleanup temporary parts
-    if os.path.exists(temp_sfc): os.remove(temp_sfc)
-    if os.path.exists(temp_pl): os.remove(temp_pl)
+    for temp_path in (temp_sfc, temp_pl, temp_land):
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
     print(f"[SUCCESS] Operational GRIB2 file ready: {output_file} ({os.path.getsize(output_file)/1024/1024:.2f} MB)")
 

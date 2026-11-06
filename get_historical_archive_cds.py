@@ -3,6 +3,7 @@ import os
 import argparse
 from datetime import datetime, timedelta, timezone
 import cdsapi
+from ingest_grib2 import grib_has_era5_land_fields
 
 def download_historical_archive(bbox, start_year, end_year, output_dir):
     """
@@ -29,9 +30,11 @@ def download_historical_archive(bbox, start_year, end_year, output_dir):
             out_pl = os.path.join(output_dir, f"era5_pl_{yr}_{mo}.grib")
             merged_file = os.path.join(output_dir, f"era5_training_{yr}_{mo}.grib2")
 
-            if os.path.exists(merged_file):
+            if os.path.exists(merged_file) and grib_has_era5_land_fields(merged_file):
                 print(f"[SKIP] Archive for {yr}-{mo} already exists on disk.")
                 continue
+            if os.path.exists(merged_file):
+                print(f"[CDS] Existing archive lacks ERA5-Land fields; refreshing {merged_file}.")
 
             print(f"\n[CDS] Downloading Surface Archive for {yr}-{mo}...")
             c.retrieve(
@@ -81,14 +84,38 @@ def download_historical_archive(bbox, start_year, end_year, output_dir):
                 out_pl
             )
 
+            out_land = os.path.join(output_dir, f"era5_land_{yr}_{mo}.grib")
+            print(f"[CDS] Downloading ERA5-Land Archive for {yr}-{mo}...")
+            c.retrieve(
+                "reanalysis-era5-land",
+                {
+                    "product_type": "reanalysis",
+                    "format": "grib",
+                    "variable": [
+                        "skin_temperature",
+                        "soil_temperature_level_1",
+                        "volumetric_soil_water_layer_1",
+                        "snow_cover",
+                    ],
+                    "year": yr,
+                    "month": mo,
+                    "day": [f"{d:02d}" for d in range(1, 32)],
+                    "time": times,
+                    "area": area,
+                },
+                out_land
+            )
+
             # Combine GRIB archives
             print(f"[CDS] Packaging combined training cube: {merged_file}")
             with open(merged_file, "wb") as outfile:
-                with open(out_sfc, "rb") as f1: outfile.write(f1.read())
-                with open(out_pl, "rb") as f2: outfile.write(f2.read())
+                for temp_path in (out_sfc, out_pl, out_land):
+                    with open(temp_path, "rb") as data_file:
+                        outfile.write(data_file.read())
 
-            if os.path.exists(out_sfc): os.remove(out_sfc)
-            if os.path.exists(out_pl): os.remove(out_pl)
+            for temp_path in (out_sfc, out_pl, out_land):
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
 
     print("\n[SUCCESS] Historical archive download cycle complete.")
 

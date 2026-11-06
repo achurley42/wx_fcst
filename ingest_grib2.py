@@ -30,6 +30,29 @@ UPPER_AIR_VARS = {
 }
 
 REQUIRED_PLEVS = [850, 700, 500, 250]
+UPPER_AIR_KEYS = tuple(
+    f"{std_name}_{plev}" for std_name in UPPER_AIR_VARS for plev in REQUIRED_PLEVS
+)
+ERA5_LAND_VARS = {
+    "land_skin_temp": ["skt", "skin_temperature"],
+    "soil_temp_1": ["stl1", "soil_temperature_level_1"],
+    "soil_moisture_1": ["swvl1", "volumetric_soil_water_layer_1"],
+    "snow_cover": ["snowc", "snow_cover"],
+}
+ERA5_LAND_KEYS = tuple(ERA5_LAND_VARS)
+ERA5_LAND_ALIASES = tuple(frozenset(aliases) for aliases in ERA5_LAND_VARS.values())
+
+
+def grib_has_era5_land_fields(grib_path):
+    import cfgrib
+
+    datasets = cfgrib.open_datasets(grib_path)
+    try:
+        available_vars = set().union(*(dataset.data_vars for dataset in datasets))
+        return all(available_vars.intersection(aliases) for aliases in ERA5_LAND_ALIASES)
+    finally:
+        for dataset in datasets:
+            dataset.close()
 
 
 def _extract_var(ds_list, alias_list, exclude_dims=()):
@@ -124,6 +147,17 @@ def load_and_regrid_grib2(grib_path, bbox, target_res):
         else:
             regridded_data[std_name] = _default_field(std_name, len(target_lats), len(target_lons))
 
+    for std_name, aliases in ERA5_LAND_VARS.items():
+        da = _extract_var(ds_list, aliases)
+        if da is not None:
+            regridded_data[std_name] = _regrid_field(
+                da, lat_name, lon_name, target_lats, target_lons, std_name
+            )
+        else:
+            regridded_data[std_name] = _default_field(
+                std_name, len(target_lats), len(target_lons)
+            )
+
     for std_name, aliases in UPPER_AIR_VARS.items():
         da = _extract_var(ds_list, aliases)
         for plev in REQUIRED_PLEVS:
@@ -141,7 +175,20 @@ def load_and_regrid_grib2(grib_path, bbox, target_res):
 
 
 def _default_field(var_name, nlat, nlon):
-    defaults = {"t2m": 288.15, "d2m": 280.15, "u10": 3.0, "v10": 1.5, "msl": 101325.0, "tp": 0.0, "orog": 150.0, "lsm": 0.5}
+    defaults = {
+        "t2m": 288.15,
+        "d2m": 280.15,
+        "u10": 3.0,
+        "v10": 1.5,
+        "msl": 101325.0,
+        "tp": 0.0,
+        "orog": 150.0,
+        "lsm": 0.5,
+        "land_skin_temp": 288.15,
+        "soil_temp_1": 288.15,
+        "soil_moisture_1": 0.25,
+        "snow_cover": 0.0,
+    }
     return np.full((nlat, nlon), defaults.get(var_name, 0.0), dtype=np.float32)
 
 
@@ -160,7 +207,20 @@ def generate_synthetic_grid(bbox, target_res):
     v10 = 2.5 * np.sin(lon_grid * 0.3)
     tp = np.clip(2.0 * np.exp(-((lon_grid - np.mean(target_lons))**2 + (lat_grid - np.mean(target_lats))**2) / 8.0), 0, 25)
 
-    data = {"t2m": t2m, "d2m": d2m, "u10": u10, "v10": v10, "msl": msl, "tp": tp, "orog": orog, "lsm": lsm}
+    data = {
+        "t2m": t2m,
+        "d2m": d2m,
+        "u10": u10,
+        "v10": v10,
+        "msl": msl,
+        "tp": tp,
+        "orog": orog,
+        "lsm": lsm,
+        "land_skin_temp": t2m.copy(),
+        "soil_temp_1": t2m - 1.5,
+        "soil_moisture_1": np.full_like(t2m, 0.25),
+        "snow_cover": np.zeros_like(t2m),
+    }
     for std_name in UPPER_AIR_VARS:
         for plev in REQUIRED_PLEVS:
             data[f"{std_name}_{plev}"] = np.full_like(t2m, 10.0 if std_name == "u" else 260.0)

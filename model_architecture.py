@@ -4,6 +4,33 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+MODEL_INPUT_CHANNELS = 34
+
+
+def load_compatible_state_dict(model, state_dict):
+    first_conv_key = "enc1.block.0.weight"
+    model_state = model.state_dict()
+    if first_conv_key in state_dict and first_conv_key in model_state:
+        saved_weight = state_dict[first_conv_key]
+        current_weight = model_state[first_conv_key]
+        if (
+            saved_weight.ndim == 4
+            and current_weight.ndim == 4
+            and saved_weight.shape[0] == current_weight.shape[0]
+            and saved_weight.shape[1] == 30
+            and current_weight.shape[1] == MODEL_INPUT_CHANNELS
+            and saved_weight.shape[2:] == current_weight.shape[2:]
+        ):
+            expanded_weight = torch.zeros_like(current_weight)
+            expanded_weight[:, :saved_weight.shape[1]] = saved_weight
+            state_dict = dict(state_dict)
+            state_dict[first_conv_key] = expanded_weight
+            print(
+                "[MODEL] Adapting 30-channel checkpoint; new ERA5-Land input "
+                "weights are initialized to zero."
+            )
+    model.load_state_dict(state_dict)
+
 
 class HybridComputeManager:
     """Manages dynamic GPU/CPU selection, thread pools, and OOM fallback."""
@@ -77,7 +104,7 @@ class ConvBlock(nn.Module):
 
 
 class WeatherSpatioTemporalUNet(nn.Module):
-    def __init__(self, in_channels=30, out_channels=6):
+    def __init__(self, in_channels=MODEL_INPUT_CHANNELS, out_channels=6):
         super().__init__()
         self.enc1 = ConvBlock(in_channels, 32)
         self.enc2 = ConvBlock(32, 64)

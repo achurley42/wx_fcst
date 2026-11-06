@@ -6,6 +6,8 @@ import pandas as pd
 import xarray as xr
 from scipy.ndimage import shift
 from datetime import datetime, timedelta
+from ingest_grib2 import ERA5_LAND_KEYS, UPPER_AIR_KEYS
+from model_architecture import MODEL_INPUT_CHANNELS, load_compatible_state_dict
 
 SURFACE_KEYS = ["t2m", "d2m", "u10", "v10", "msl", "tp"]
 
@@ -16,7 +18,7 @@ def run_hourly_72hr_forecast(grid_data, lats, lons, model, compute_mgr, start_ti
     """
     if weights_path and os.path.exists(weights_path):
         print(f"[MODEL] Loading fine-tuned weights from {weights_path}")
-        model.load_state_dict(torch.load(weights_path, map_location="cpu"))
+        load_compatible_state_dict(model, torch.load(weights_path, map_location="cpu"))
     else:
         print("[MODEL] No custom weights specified. Running Physics-Guided Neural Hybrid baseline (Hourly Mode).")
     model.eval()
@@ -63,12 +65,12 @@ def run_hourly_72hr_forecast(grid_data, lats, lons, model, compute_mgr, start_ti
         prev_diurnal = np.cos((prev_solar_hr - 14.0) * 2.0 * np.pi / 24.0).astype(np.float32)
         diurnal_delta = diurnal_wave - prev_diurnal
 
-        # 2. Assemble 30-channel input tensor
+        # 2. Assemble ERA5 atmospheric, geographic, and ERA5-Land input channels
         channels = []
         for k in SURFACE_KEYS:
             arr = history[k][step - 1]
             channels.append((arr - np.mean(arr)) / (np.std(arr) + 1e-5))
-        for k in [key for key in grid_data.keys() if "_" in key]:
+        for k in UPPER_AIR_KEYS:
             arr = grid_data[k]
             channels.append((arr - np.mean(arr)) / (np.std(arr) + 1e-5))
         channels.extend([
@@ -77,11 +79,15 @@ def run_hourly_72hr_forecast(grid_data, lats, lons, model, compute_mgr, start_ti
             diurnal_wave,
             np.sin(np.deg2rad(lat_grid)).astype(np.float32)
         ])
+        for k in ERA5_LAND_KEYS:
+            arr = grid_data[k]
+            channels.append((arr - np.mean(arr)) / (np.std(arr) + 1e-5))
 
-        while len(channels) < 30:
-            channels.append(np.zeros_like(orog_norm))
-
-        x_tensor = torch.tensor(np.stack(channels[:30], axis=0), dtype=torch.float32).unsqueeze(0)
+        if len(channels) != MODEL_INPUT_CHANNELS:
+            raise ValueError(
+                f"Expected {MODEL_INPUT_CHANNELS} model input channels, got {len(channels)}"
+            )
+        x_tensor = torch.tensor(np.stack(channels, axis=0), dtype=torch.float32).unsqueeze(0)
 
         # 3. Neural residual inference (scaled to 1-hour tendency)
         nn_delta = compute_mgr.safe_forward(model, x_tensor).squeeze(0).numpy() / 6.0
