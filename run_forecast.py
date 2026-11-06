@@ -103,6 +103,45 @@ def retrieve_cds_operational_analysis(bbox, target_date_utc, output_path):
     print(f"[SUCCESS] Download completed ({os.path.getsize(output_path)/1024/1024:.2f} MB).\n")
 
 
+def existing_cds_data_matches_time(grib_path, target_time_utc):
+    if not os.path.isfile(grib_path) or os.path.getsize(grib_path) == 0:
+        return False
+
+    datasets = []
+    try:
+        import cfgrib
+        import numpy as np
+
+        datasets = cfgrib.open_datasets(grib_path)
+        if not datasets:
+            print(f"[CDS] Existing file has no readable GRIB datasets: {grib_path}")
+            return False
+
+        expected_time = np.datetime64(
+            target_time_utc.astimezone(timezone.utc).replace(tzinfo=None), "s"
+        )
+        for dataset in datasets:
+            time_coord = dataset.coords.get("time", dataset.coords.get("valid_time"))
+            if time_coord is None:
+                print(f"[CDS] Existing GRIB data has no timestamp: {grib_path}")
+                return False
+
+            actual_times = np.asarray(time_coord.values).astype("datetime64[s]")
+            if actual_times.size == 0 or np.any(actual_times != expected_time):
+                print(
+                    f"[CDS] Existing GRIB timestamp does not match "
+                    f"{target_time_utc.strftime('%Y-%m-%d %H:%M UTC')}: {grib_path}"
+                )
+                return False
+        return True
+    except Exception as exc:
+        print(f"[CDS] Could not verify existing GRIB data ({exc}); downloading again.")
+        return False
+    finally:
+        for dataset in datasets:
+            dataset.close()
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Standalone Hybrid GPU/CPU 72-Hour Hourly AI Weather Model")
     parser.add_argument("--grib", type=str, default="input_analysis.grib2", help="Path to input GRIB2 file")
@@ -114,7 +153,7 @@ def parse_args():
     parser.add_argument("--lon-max", type=float, required=True, help="Maximum Longitude")
     parser.add_argument("--res", type=float, default=0.10, help="Target spatial resolution in degrees")
     parser.add_argument("--weights", type=str, default=None, help="Optional path to fine-tuned .pt weights")
-    parser.add_argument("--plot-interval", type=int, default=6, help="Interval in hours for prognostic charts (e.g. 1, 6, 12)")
+    parser.add_argument("--plot-interval", type=int, default=1, help="Interval in hours for prognostic charts (e.g. 1, 6, 12)")
     parser.add_argument("--force-cpu", action="store_true", help="Force execution on CPU")
     parser.add_argument("--skip-dep-check", action="store_true", help="Bypass pre-flight dependency checker")
     parser.add_argument("--outdir", type=str, default="./forecast_output", help="Output directory")
@@ -139,7 +178,13 @@ def main():
             target_time = (datetime.now(timezone.utc) - timedelta(days=6)).replace(minute=0, second=0, microsecond=0)
 
         os.makedirs(os.path.dirname(os.path.abspath(args.grib)), exist_ok=True)
-        retrieve_cds_operational_analysis(bbox, target_time, args.grib)
+        if existing_cds_data_matches_time(args.grib, target_time):
+            print(
+                f"[CDS] Reusing existing data for "
+                f"{target_time.strftime('%Y-%m-%d %H:%M UTC')}: {args.grib}"
+            )
+        else:
+            retrieve_cds_operational_analysis(bbox, target_time, args.grib)
 
     print("=" * 70)
     print("  AIR FORCE STANDALONE REGIONAL AI WEATHER MODEL (HOURLY ROLLOUT)")

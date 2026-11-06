@@ -133,6 +133,7 @@ def export_hourly_deliverables(history, lats, lons, valid_times, orog, lsm, outp
     os.makedirs(hourly_nc_dir, exist_ok=True)
 
     num_steps = len(valid_times)
+    time_coords = pd.to_datetime(valid_times, utc=True).tz_localize(None).to_numpy()
 
     # 1. Export Individual Hourly NetCDF4 Files
     print(f"[EXPORT] Writing {num_steps} individual hourly NetCDF4 files to '{hourly_nc_dir}'...")
@@ -171,7 +172,7 @@ def export_hourly_deliverables(history, lats, lons, valid_times, orog, lsm, outp
             "orog": (["lat", "lon"], orog, {"units": "m", "long_name": "Terrain Elevation"}),
             "lsm": (["lat", "lon"], lsm, {"units": "fraction", "long_name": "Land-Sea Mask"}),
         },
-        coords={"time": valid_times, "lat": lats, "lon": lons}
+        coords={"time": time_coords, "lat": lats, "lon": lons}
     )
     ds_master.to_netcdf(master_nc_path)
     print(f"[EXPORT] Saved Master 73-Hour NetCDF4 Cube: {master_nc_path}")
@@ -205,7 +206,7 @@ def export_hourly_deliverables(history, lats, lons, valid_times, orog, lsm, outp
     # 4. Generate Prognostic Surface Charts
     import matplotlib.pyplot as plt
     lon_g, lat_g = np.meshgrid(lons, lats)
-    plot_steps = list(range(plot_interval, num_steps, plot_interval))
+    plot_steps = list(range(0, num_steps, plot_interval))
     if 24 not in plot_steps: plot_steps.append(24)
     if 48 not in plot_steps: plot_steps.append(48)
     if 72 not in plot_steps: plot_steps.append(72)
@@ -227,6 +228,9 @@ def export_hourly_deliverables(history, lats, lons, valid_times, orog, lsm, outp
         msl_hpa = history["msl"][step_idx] / 100.0
         wspd_kt = np.hypot(history["u10"][step_idx], history["v10"][step_idx]) * 1.94384
         c2 = axes[0, 1].contourf(lon_g, lat_g, wspd_kt, levels=12, cmap="YlOrRd")
+        axes[0, 1].contour(
+            lon_g, lat_g, lsm, levels=[0.5], colors="black", linewidths=1.2, zorder=5
+        )
         cs = axes[0, 1].contour(lon_g, lat_g, msl_hpa, levels=10, colors="black", linewidths=0.8)
         axes[0, 1].clabel(cs, inline=True, fontsize=8, fmt="%1.0f")
         skip = max(1, len(lats) // 12)
@@ -247,6 +251,9 @@ def export_hourly_deliverables(history, lats, lons, valid_times, orog, lsm, outp
 
         # 1-Hour Precip & Terrain Orography
         c4 = axes[1, 1].contourf(lon_g, lat_g, history["tp"][step_idx], levels=12, cmap="Blues")
+        axes[1, 1].contour(
+            lon_g, lat_g, lsm, levels=[0.5], colors="black", linewidths=1.2, zorder=5
+        )
         axes[1, 1].contour(lon_g, lat_g, orog, levels=6, colors="saddlebrown", linewidths=0.7, alpha=0.6)
         axes[1, 1].set_title("1-Hour Precip Accumulation (mm) & Terrain Orography")
         fig.colorbar(c4, ax=axes[1, 1])

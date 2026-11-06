@@ -3,6 +3,7 @@ import warnings
 import numpy as np
 import xarray as xr
 from scipy.interpolate import RegularGridInterpolator
+from scipy.ndimage import distance_transform_edt
 
 warnings.filterwarnings("ignore")
 
@@ -31,11 +32,13 @@ UPPER_AIR_VARS = {
 REQUIRED_PLEVS = [850, 700, 500, 250]
 
 
-def _extract_var(ds_list, alias_list):
+def _extract_var(ds_list, alias_list, exclude_dims=()):
     for ds in ds_list:
         for alias in alias_list:
             if alias in ds.data_vars:
-                return ds[alias]
+                da = ds[alias]
+                if not any(dim in da.dims for dim in exclude_dims):
+                    return da
     return None
 
 
@@ -52,11 +55,22 @@ def _regrid_field(da, lat_name, lon_name, target_lats, target_lons, var_name):
         da = da.isel({dim: 0}, drop=True)
 
     da_interp = da.interp({lat_name: target_lats, lon_name: target_lons}, method="linear")
-    values = da_interp.transpose(lat_name, lon_name).values
+    values = np.array(da_interp.transpose(lat_name, lon_name).values, copy=True)
     expected_shape = (len(target_lats), len(target_lons))
     if values.shape != expected_shape:
         raise ValueError(
             f"Cannot regrid {var_name}: expected shape {expected_shape}, got {values.shape}"
+        )
+    missing = ~np.isfinite(values)
+    if np.any(missing):
+        valid = ~missing
+        if not np.any(valid):
+            raise ValueError(f"Cannot regrid {var_name}: field contains no finite values")
+        _, nearest_indices = distance_transform_edt(missing, return_indices=True)
+        values[missing] = values[tuple(index[missing] for index in nearest_indices)]
+        print(
+            f"[WARN] Filled {np.count_nonzero(missing)} missing {var_name} grid cells "
+            "from their nearest valid cells."
         )
     return values
 
@@ -99,7 +113,7 @@ def load_and_regrid_grib2(grib_path, bbox, target_res):
             regridded_data[std_name] = _default_field(std_name, len(target_lats), len(target_lons))
 
     for std_name, aliases in STATIC_VARS.items():
-        da = _extract_var(ds_list, aliases)
+        da = _extract_var(ds_list, aliases, exclude_dims=("isobaricInhPa",))
         if da is not None:
             vals = _regrid_field(
                 da, lat_name, lon_name, target_lats, target_lons, std_name
