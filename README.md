@@ -144,7 +144,7 @@ The model uses 34 input channels, retaining the existing ERA5 atmospheric inputs
 Execute an immediate 72-hour forecast generating individual hourly files and consolidated cubes without requiring any pre-trained weights:
 
 ```bash
-python run_forecast.py \
+python3 run_forecast.py \
   --grib ./analysis_current.grib2 \
   --lat-min 25.0 \
   --lat-max 35.0 \
@@ -158,7 +158,7 @@ python run_forecast.py \
 Pass custom fine-tuned weights using the `--weights` flag. If omitted, the driver checks `./checkpoints/calibration_registry.json` for an accepted or fallback 34-channel calibration for the forecast initialization month whose bounding box covers at least 50% of the requested area. An accepted calibration is preferred over a fallback.
 
 ```bash
-python run_forecast.py \
+python3 run_forecast.py \
   --grib ./analysis_current.grib2 \
   --lat-min 25.0 \
   --lat-max 35.0 \
@@ -175,8 +175,20 @@ Download two complete years of six-hourly ERA5 and ERA5-Land data, train one mod
 
 See [TRAINING_PIPELINE.md](./TRAINING_PIPELINE.md) for the detailed training, validation, caching, and monthly weight-selection design.
 
+To diagnose the training setup before running calibration, use `debug_training.py`. It prints to the screen, checks archive names/sizes and regrid-cache entries, and opens a limited number of uncached GRIB files in timed child processes. It does not download data or ask cfgrib to write index sidecars. Add `--output-file ./training_logs/debug_training.log` to tee screen output to a file (overwriting that file if it already exists). Add `--check-regrid` to run a full in-memory regrid for each inspected uncached file; use `--max-open-files 0` to inspect every uncached archive.
+
 ```bash
-python train_unet.py \
+python3 debug_training.py \
+  --use-cds \
+  --start-year 2022 --end-year 2023 \
+  --lat-min 25 --lat-max 35 \
+  --lon-min -90 --lon-max -80 \
+  --res 0.10 \
+  --output-file ./training_logs/debug_training.log
+```
+
+```bash
+python3 train_unet.py \
   --use-cds \
   --lat-min 25 --lat-max 35 \
   --lon-min -90 --lon-max -80 \
@@ -195,7 +207,7 @@ If the script cannot produce a finite validation candidate or lacks enough train
 Omit `--grib` or pass an unlocated file path to test execution on standalone systems:
 
 ```bash
-python run_forecast.py \
+python3 run_forecast.py \
   --lat-min 28.0 --lat-max 36.0 \
   --lon-min -85.0 --lon-max -75.0 \
   --res 0.10 \
