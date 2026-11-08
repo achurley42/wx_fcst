@@ -48,7 +48,7 @@ def overlap_fraction(requested_bbox, saved_bbox):
     return min(1.0, _area(intersection) / requested_area)
 
 
-def find_compatible_calibration(registry_path, bbox, season, minimum_overlap=0.5):
+def find_compatible_calibration(registry_path, bbox, month, minimum_overlap=0.5):
     if not os.path.isfile(registry_path):
         return None
 
@@ -57,7 +57,7 @@ def find_compatible_calibration(registry_path, bbox, season, minimum_overlap=0.5
 
     candidates = []
     for entry in registry.get("calibrations", []):
-        if entry.get("season") != season or entry.get("input_channels") != 34:
+        if entry.get("month") != month or entry.get("input_channels") != 34:
             continue
         weight_path = entry.get("weights_path")
         if not weight_path or not os.path.isfile(weight_path):
@@ -67,7 +67,14 @@ def find_compatible_calibration(registry_path, bbox, season, minimum_overlap=0.5
             candidates.append((fraction, entry))
     if not candidates:
         return None
-    fraction, entry = max(candidates, key=lambda candidate: candidate[0])
+    fraction, entry = max(
+        candidates,
+        key=lambda candidate: (
+            candidate[1].get("status", "accepted") != "fallback",
+            candidate[0],
+            -candidate[1].get("validation_score", float("inf")),
+        ),
+    )
     return entry, fraction
 
 
@@ -79,14 +86,31 @@ def save_calibration(registry_path, calibration):
         with open(registry_path, "r", encoding="utf-8") as registry_file:
             registry = json.load(registry_file)
     else:
-        registry = {"version": 1, "calibrations": []}
+        registry = {"version": 2, "calibrations": []}
 
+    registry["version"] = 2
     entries = registry.setdefault("calibrations", [])
+
+    def same_month_region(entry):
+        return (
+            entry.get("month") == calibration["month"]
+            and entry.get("bbox") == calibration["bbox"]
+        )
+
+    existing_accepted = any(
+        same_month_region(entry)
+        and entry.get("status", "accepted") == "accepted"
+        for entry in entries
+    )
+    keep_existing_accepted = (
+        calibration.get("status") == "fallback" and existing_accepted
+    )
     entries[:] = [
         entry for entry in entries
-        if not (
-            entry.get("season") == calibration["season"]
-            and entry.get("bbox") == calibration["bbox"]
+        if not same_month_region(entry)
+        or (
+            keep_existing_accepted
+            and entry.get("status", "accepted") == "accepted"
         )
     ]
     entries.append(calibration)

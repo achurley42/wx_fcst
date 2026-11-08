@@ -12,7 +12,7 @@ except Exception as e:
     print(f"[WARN] Dependency check encountered an issue: {e}. Attempting standard run...")
 
 from ingest_grib2 import ERA5_LAND_ALIASES, load_and_regrid_grib2
-from calibration_registry import find_compatible_calibration, season_for_time
+from calibration_registry import find_compatible_calibration
 from model_architecture import (
     MODEL_INPUT_CHANNELS,
     HybridComputeManager,
@@ -188,7 +188,7 @@ def parse_args():
         "--calibration-registry",
         type=str,
         default="./checkpoints/calibration_registry.json",
-        help="Regional/seasonal calibrated-weight registry",
+        help="Regional/monthly calibrated-weight registry",
     )
     parser.add_argument("--plot-interval", type=int, default=1, help="Interval in hours for prognostic charts (e.g. 1, 6, 12)")
     parser.add_argument("--force-cpu", action="store_true", help="Force execution on CPU")
@@ -238,20 +238,21 @@ def main():
     init_time = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     weights_path = args.weights
     if weights_path is None:
-        season = season_for_time(init_time, (args.lat_min + args.lat_max) / 2.0)
         match = find_compatible_calibration(
-            args.calibration_registry, bbox, season, minimum_overlap=0.5
+            args.calibration_registry, bbox, init_time.month, minimum_overlap=0.5
         )
         if match:
             calibration, overlap = match
             weights_path = calibration["weights_path"]
             print(
-                f"[MODEL] Reusing {season} calibration from "
-                f"{calibration['bbox']} (region overlap {overlap:.0%}): {weights_path}"
+                f"[MODEL] Reusing {init_time.strftime('%B')} calibration from "
+                f"{calibration['bbox']} (region overlap {overlap:.0%}, "
+                f"status={calibration.get('status', 'accepted')}): {weights_path}"
             )
         else:
             print(
-                f"[MODEL] No {season} calibration overlaps this region by at least 50%; "
+                f"[MODEL] No {init_time.strftime('%B')} calibration overlaps this "
+                "region by at least 50%; "
                 "using baseline weights."
             )
 

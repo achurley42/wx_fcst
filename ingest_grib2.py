@@ -1,4 +1,8 @@
 # ingest_grib2.py
+import glob
+import os
+import threading
+import time
 import warnings
 import numpy as np
 import xarray as xr
@@ -41,23 +45,83 @@ ERA5_LAND_VARS = {
 }
 ERA5_LAND_KEYS = tuple(ERA5_LAND_VARS)
 ERA5_LAND_ALIASES = tuple(frozenset(aliases) for aliases in ERA5_LAND_VARS.values())
+GRID_SEQUENCE_KEYS = (
+    tuple(SURFACE_VARS)
+    + tuple(
+        f"{variable}_{pressure_level}"
+        for variable in UPPER_AIR_VARS
+        for pressure_level in REQUIRED_PLEVS
+    )
+    + tuple(STATIC_VARS)
+    + ERA5_LAND_KEYS
+)
 
 
 def grib_has_era5_land_fields(grib_path):
-    datasets = []
+    started = time.monotonic()
+    scanned_messages = 0
+    available_fields = set()
     try:
-        datasets = _open_grib_datasets(grib_path)
-        if not datasets:
-            print(f"[WARN] No readable GRIB datasets found in {grib_path}.")
+        import eccodes
+
+        print(
+            f"[CDS] Scanning GRIB message headers for ERA5-Land fields: "
+            f"{grib_path}",
+            flush=True,
+        )
+        with open(grib_path, "rb") as grib_file:
+            last_progress = started
+            while True:
+                message = eccodes.codes_grib_new_from_file(grib_file)
+                if message is None:
+                    break
+                try:
+                    available_fields.add(eccodes.codes_get(message, "shortName"))
+                    scanned_messages += 1
+                finally:
+                    eccodes.codes_release(message)
+
+                now = time.monotonic()
+                if now - last_progress >= 30:
+                    print(
+                        f"[CDS] Scanned {scanned_messages} GRIB messages "
+                        f"({now - started:.0f}s elapsed): {grib_path}",
+                        flush=True,
+                    )
+                    last_progress = now
+
+        if scanned_messages == 0:
+            print(f"[WARN] No readable GRIB messages found in {grib_path}.", flush=True)
             return False
-        available_vars = set().union(*(dataset.data_vars for dataset in datasets))
-        return all(available_vars.intersection(aliases) for aliases in ERA5_LAND_ALIASES)
+
+        missing_fields = [
+            aliases for aliases in ERA5_LAND_ALIASES
+            if not available_fields.intersection(aliases)
+        ]
+        if missing_fields:
+            missing_names = ", ".join("/".join(sorted(names)) for names in missing_fields)
+            print(
+                f"[CDS] Required ERA5-Land GRIB fields not found: {missing_names} "
+                f"(scanned {scanned_messages} messages in "
+                f"{time.monotonic() - started:.1f}s)",
+                flush=True,
+            )
+            return False
+        print(
+            f"[CDS] ERA5-Land field verification completed: found all required "
+            f"fields in {scanned_messages} messages "
+            f"({time.monotonic() - started:.1f}s): {grib_path}",
+            flush=True,
+        )
+        return True
     except Exception as exc:
-        print(f"[WARN] Could not verify ERA5-Land fields in {grib_path}: {exc}")
+        print(
+            f"[WARN] Could not scan GRIB headers in {grib_path} after "
+            f"{time.monotonic() - started:.1f}s and {scanned_messages} messages: "
+            f"{exc}",
+            flush=True,
+        )
         return False
-    finally:
-        for dataset in datasets:
-            dataset.close()
 
 
 def _extract_var(ds_list, alias_list, exclude_dims=(), valid_time=None):
@@ -76,11 +140,14 @@ def _extract_var(ds_list, alias_list, exclude_dims=(), valid_time=None):
 def _has_valid_time(da, valid_time):
     if valid_time is None:
         return True
+    found_time_coordinate = False
     for coord_name in ("valid_time", "time"):
         if coord_name in da.coords:
+            found_time_coordinate = True
             values = np.asarray(da.coords[coord_name].values).astype("datetime64[ns]")
-            return bool(np.any(values == np.datetime64(valid_time, "ns")))
-    return "time" not in da.dims
+            if np.any(values == np.datetime64(valid_time, "ns")):
+                return True
+    return not found_time_coordinate and "time" not in da.dims
 
 
 def _select_valid_time(da, valid_time):
@@ -125,6 +192,10 @@ def _regrid_field(da, lat_name, lon_name, target_lats, target_lons, var_name, va
         raise ValueError(
             f"Cannot regrid {var_name}: expected shape {expected_shape}, got {values.shape}"
         )
+    return _fill_missing_values(values, var_name)
+
+
+def _fill_missing_values(values, var_name):
     missing = ~np.isfinite(values)
     if np.any(missing):
         valid = ~missing
@@ -137,6 +208,66 @@ def _regrid_field(da, lat_name, lon_name, target_lats, target_lons, var_name, va
             "from their nearest valid cells."
         )
     return values
+
+
+def _regrid_sequence_field(
+    da, lat_name, lon_name, target_lats, target_lons, var_name, valid_times
+):
+    temporal_coord = None
+    for coord_name in ("valid_time", "time"):
+        if coord_name in da.coords:
+            coord = da.coords[coord_name]
+            if coord.dims and all(dim in da.dims for dim in coord.dims):
+                temporal_coord = coord
+                break
+
+    da_interp = da.interp(
+        {lat_name: target_lats, lon_name: target_lons}, method="linear"
+    )
+    temporal_dims = () if temporal_coord is None else temporal_coord.dims
+    for dim in [
+        dim for dim in da_interp.dims
+        if dim not in (lat_name, lon_name) and dim not in temporal_dims
+    ]:
+        if da_interp.sizes[dim] != 1:
+            raise ValueError(
+                f"Cannot regrid {var_name}: unexpected non-spatial dimension "
+                f"{dim!r} has size {da_interp.sizes[dim]}"
+            )
+        da_interp = da_interp.isel({dim: 0}, drop=True)
+
+    expected_shape = (len(target_lats), len(target_lons))
+    if temporal_coord is None:
+        values = np.asarray(
+            da_interp.transpose(lat_name, lon_name).values, dtype=np.float32
+        )
+        if values.shape != expected_shape:
+            raise ValueError(
+                f"Cannot regrid {var_name}: expected shape {expected_shape}, "
+                f"got {values.shape}"
+            )
+        values = _fill_missing_values(values, var_name)
+        return {valid_time: values for valid_time in valid_times}
+
+    times = np.asarray(temporal_coord.values).astype("datetime64[ns]")
+    values = np.asarray(
+        da_interp.transpose(*temporal_dims, lat_name, lon_name).values,
+        dtype=np.float32,
+    )
+    if times.size != int(np.prod(values.shape[:-2])):
+        raise ValueError(
+            f"Cannot regrid {var_name}: time coordinate shape {times.shape} "
+            f"does not match data dimensions {values.shape}"
+        )
+    times = times.reshape(-1)
+    values = values.reshape((-1,) + expected_shape)
+    requested_times = set(valid_times)
+    regridded = {}
+    for timestamp, field in zip(times, values):
+        if np.isnat(timestamp) or timestamp not in requested_times:
+            continue
+        regridded[timestamp] = _fill_missing_values(field, var_name)
+    return regridded
 
 
 def _available_valid_times(ds_list):
@@ -235,10 +366,173 @@ def _regrid_datasets(ds_list, bbox, target_res, valid_time=None):
     return regridded_data, target_lats, target_lons
 
 
+def _regrid_datasets_sequence(ds_list, bbox, target_res, valid_times):
+    target_lats = np.arange(
+        bbox["lat_min"], bbox["lat_max"] + target_res / 2, target_res
+    )
+    target_lons = np.arange(
+        bbox["lon_min"], bbox["lon_max"] + target_res / 2, target_res
+    )
+    sample_ds = ds_list[0]
+    lat_name = "latitude" if "latitude" in sample_ds.coords else "lat"
+    lon_name = "longitude" if "longitude" in sample_ds.coords else "lon"
+
+    if sample_ds[lon_name].max() > 180 and bbox["lon_min"] < 0:
+        for index, dataset in enumerate(ds_list):
+            ds_list[index] = dataset.assign_coords(
+                {lon_name: (((dataset[lon_name] + 180) % 360) - 180)}
+            ).sortby(lon_name)
+
+    fields = {}
+
+    def add_field(key, aliases, exclude_dims=(), pressure_level=None):
+        da = _extract_var(ds_list, aliases, exclude_dims=exclude_dims)
+        if da is None:
+            return
+        if pressure_level is not None:
+            levels = da.coords.get("isobaricInhPa")
+            if levels is None or pressure_level not in levels.values:
+                return
+            da = da.sel(isobaricInhPa=pressure_level)
+        values = _regrid_sequence_field(
+            da, lat_name, lon_name, target_lats, target_lons, key, valid_times
+        )
+        if key in STATIC_VARS and values:
+            static_field = next(iter(values.values()))
+            values = {timestamp: static_field for timestamp in valid_times}
+        if key == "orog":
+            values = {
+                timestamp: (
+                    field / 9.80665 if np.nanmax(field) > 9000 else field
+                )
+                for timestamp, field in values.items()
+            }
+        fields[key] = values
+
+    print("[INGEST] Regridding ERA5 surface fields...")
+    for key, aliases in SURFACE_VARS.items():
+        add_field(key, aliases)
+    print("[INGEST] Regridding static terrain and land-sea fields...")
+    for key, aliases in STATIC_VARS.items():
+        add_field(key, aliases, exclude_dims=("isobaricInhPa",))
+    print("[INGEST] Regridding ERA5-Land fields...")
+    for key, aliases in ERA5_LAND_VARS.items():
+        add_field(key, aliases)
+    print("[INGEST] Regridding upper-air pressure-level fields...")
+    for variable, aliases in UPPER_AIR_VARS.items():
+        for pressure_level in REQUIRED_PLEVS:
+            key = f"{variable}_{pressure_level}"
+            add_field(key, aliases, pressure_level=pressure_level)
+
+    required_keys = set(SURFACE_VARS)
+    missing_land_fields = set(ERA5_LAND_VARS).difference(fields)
+    if missing_land_fields:
+        print(
+            "[WARN] Historical archive is missing ERA5-Land field(s): "
+            + ", ".join(sorted(missing_land_fields))
+            + "; using neutral defaults for those input channels.",
+            flush=True,
+        )
+    frames = []
+    for timestamp in valid_times:
+        grid_data = {}
+        for key in GRID_SEQUENCE_KEYS:
+            field = fields.get(key, {}).get(timestamp)
+            if field is None:
+                if key in required_keys:
+                    category = (
+                        "ERA5-Land" if key in ERA5_LAND_VARS else "required"
+                    )
+                    raise ValueError(
+                        f"Historical GRIB frame {timestamp} is missing "
+                        f"{category} field {key}"
+                    )
+                field = _default_field(key, len(target_lats), len(target_lons))
+            grid_data[key] = field
+        frame_time = timestamp.astype("datetime64[us]").astype(object)
+        frames.append((frame_time, grid_data))
+    return frames, target_lats, target_lons
+
+
 def _open_grib_datasets(grib_path):
     import cfgrib
 
-    return cfgrib.open_datasets(grib_path)
+    started = time.monotonic()
+    finished = threading.Event()
+    empty_indexes = [
+        index_path
+        for index_path in glob.glob(grib_path + ".*.idx")
+        if os.path.getsize(index_path) == 0
+    ]
+    index_generation = 0
+    while any(
+        os.path.getsize(index_path) == 0
+        for index_path in glob.glob(
+            f"{grib_path}.cfgrib-cache-{index_generation}-*.idx"
+        )
+    ):
+        index_generation += 1
+    recovery_indexpath = (
+        f"{grib_path}.cfgrib-cache-{index_generation}-{{short_hash}}.idx"
+    )
+    use_default_index_cache = not empty_indexes
+    if empty_indexes:
+        print(
+            "[GRIB] Empty cfgrib index sidecar(s) found; ignoring them and "
+            f"using a separate persistent index: {', '.join(empty_indexes)}",
+            flush=True,
+        )
+
+    def report_progress():
+        while not finished.wait(30):
+            elapsed = time.monotonic() - started
+            print(
+                f"[GRIB] Still scanning {grib_path} "
+                f"({elapsed:.0f}s elapsed; index cache "
+                f"{'enabled' if use_default_index_cache else 'rebuilding'}).",
+                flush=True,
+            )
+
+    print(
+        f"[GRIB] Starting cfgrib scan of {grib_path} "
+        f"(index cache {'enabled' if use_default_index_cache else 'rebuilding'}).",
+        flush=True,
+    )
+    reporter = threading.Thread(target=report_progress, daemon=True)
+    reporter.start()
+    try:
+        if use_default_index_cache:
+            try:
+                datasets = cfgrib.open_datasets(grib_path)
+            except Exception as cached_error:
+                print(
+                    f"[GRIB] Cached-index open failed for {grib_path}: "
+                    f"{cached_error}. Retrying with a separate persistent index.",
+                    flush=True,
+                )
+                datasets = cfgrib.open_datasets(
+                    grib_path,
+                    backend_kwargs={"indexpath": recovery_indexpath},
+                )
+        else:
+            datasets = cfgrib.open_datasets(
+                grib_path, backend_kwargs={"indexpath": recovery_indexpath}
+            )
+    except Exception as exc:
+        print(
+            f"[GRIB] Scan failed after {time.monotonic() - started:.1f}s: {exc}",
+            flush=True,
+        )
+        raise
+    finally:
+        finished.set()
+        reporter.join()
+    print(
+        f"[GRIB] cfgrib opened {len(datasets)} dataset group(s) in "
+        f"{time.monotonic() - started:.1f}s: {grib_path}",
+        flush=True,
+    )
+    return datasets
 
 
 def load_and_regrid_grib2_sequence(grib_path, bbox, target_res):
@@ -256,14 +550,14 @@ def load_and_regrid_grib2_sequence(grib_path, bbox, target_res):
             grid_data, lats, lons = _regrid_datasets(ds_list, bbox, target_res)
             return [(None, grid_data)], lats, lons
 
-        frames = []
-        lats = lons = None
-        for valid_time in valid_times:
-            grid_data, lats, lons = _regrid_datasets(
-                ds_list, bbox, target_res, valid_time
-            )
-            frame_time = valid_time.astype("datetime64[us]").astype(object)
-            frames.append((frame_time, grid_data))
+        print(
+            f"[INGEST] Regridding {len(valid_times)} timestamps in batches "
+            "to avoid repeating interpolation for every frame."
+        )
+        frames, lats, lons = _regrid_datasets_sequence(
+            ds_list, bbox, target_res, valid_times
+        )
+        print(f"[INGEST] Regridded {len(frames)} frames from {grib_path}.")
         return frames, lats, lons
     finally:
         for dataset in ds_list:

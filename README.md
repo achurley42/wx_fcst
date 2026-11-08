@@ -155,7 +155,7 @@ python run_forecast.py \
 ```
 
 ### 2. Fine-Tuned Model Inference
-Pass custom fine-tuned weights using the `--weights` flag. If omitted, the driver checks `./checkpoints/calibration_registry.json` for an accepted 34-channel calibration from the matching hemisphere season whose bounding box covers at least 50% of the requested area.
+Pass custom fine-tuned weights using the `--weights` flag. If omitted, the driver checks `./checkpoints/calibration_registry.json` for an accepted or fallback 34-channel calibration for the forecast initialization month whose bounding box covers at least 50% of the requested area. An accepted calibration is preferred over a fallback.
 
 ```bash
 python run_forecast.py \
@@ -170,8 +170,10 @@ python run_forecast.py \
   --outdir ./forecast_output
 ```
 
-### 3. Historical Seasonal Calibration
-Download two complete years of six-hourly ERA5 and ERA5-Land data, train one model per meteorological season, and validate independent 72-hour rollouts against ERA5 at every six-hour lead:
+### 3. Historical Monthly Calibration
+Download two complete years of six-hourly ERA5 and ERA5-Land data, train one model per calendar month and region, and validate independent 72-hour rollouts against ERA5 at every six-hour lead:
+
+See [TRAINING_PIPELINE.md](./TRAINING_PIPELINE.md) for the detailed training, validation, caching, and monthly weight-selection design.
 
 ```bash
 python train_unet.py \
@@ -181,11 +183,13 @@ python train_unet.py \
   --res 0.10
 ```
 
-By default, the script uses the two most recent complete years, holds out the latest year, and runs up to five train/verify rounds per season. A season's weights are saved and added to `checkpoints/calibration_registry.json` only if all six atmospheric variables pass RMSE limits at every lead from T+06h through T+72h. Defaults are 3 K for temperature/dewpoint, 3 m/s for each wind component, 5 hPa for MSLP, and 3 mm for one-hour precipitation. Override with `--rmse-temperature-k`, `--rmse-wind-ms`, `--rmse-mslp-hpa`, and `--rmse-precip-mm`. Bias is reported but is not an independent acceptance gate. ERA5-Land fields are model inputs; this atmospheric-output model does not forecast or score soil states.
+By default, the script uses the two most recent complete years and holds out the latest year. It trains one calibration for each calendar month; `--epochs` is the budget per monthly model (default 15), distributed across up to five train/verify rounds. With `--use-cds`, monthly archive names include latitude/longitude bounds and year/month (for example, `era5_train_lat25_35_lon-90_-80_2022_01.grib2`). A matching nonempty file is reused without scanning its GRIB contents, and only missing or empty months are downloaded. Files with different bounds are kept separate; generic monthly files without bounds are not assumed to match. Without `--use-cds`, the script uses local GRIB files. Regridded frames are cached persistently per input archive under `~/.cache/wx_fcst/regrid` by default (override with `--cache-dir`), keyed by source path, size, modification time, bounds, resolution, and channel schema. Completed archives are reused on restart; missing or invalid cache entries are rebuilt. The cache can be deleted to force regridding again. Screen output and errors are also written to `./training_logs/train_<timestamp>.log` by default; override the location with `--log-file`.
 
-Each calibration round trains for `--epochs` epochs (default 15); the latest year's early 70% of each season is used for iterative calibration checks, and later cases are reserved for final testing. Validation and test rollouts are separated by more than 72 hours to prevent their verification windows from overlapping. Regridded training frames use per-field offsets and scales in a temporary float16 disk-backed cache, avoiding overflow in high-magnitude fields while limiting RAM use; fine-resolution, large-area runs may need several GB of temporary disk space.
+The script selects the best monthly candidate using validation RMSE normalized by each variable's configured limit. If a candidate passes all limits on validation and the independent final test, it is registered as accepted. If none pass both, the best validation candidate is still saved and registered as a fallback, with its status and test metrics recorded; the forecast runner may use it for the matching month and region. Existing accepted calibrations are preferred over fallbacks. Regional matching retains the 50% bbox-overlap rule. Forecasts select weights by their initialization month. Defaults are 3 K for temperature/dewpoint, 3 m/s for each wind component, 5 hPa for MSLP, and 3 mm for one-hour precipitation. Override with `--rmse-temperature-k`, `--rmse-wind-ms`, `--rmse-mslp-hpa`, and `--rmse-precip-mm`. Bias is reported but is not an independent acceptance gate. ERA5-Land fields are model inputs; this atmospheric-output model does not forecast or score soil states.
 
-If a season fails after the configured rounds, no weights are registered for it and the command reports failure. Increase the training history, adjust RMSE thresholds, or review the per-lead metrics before relying on a calibration.
+For each month, 72-hour validation and test rollouts are kept separate. Training only selects files with known GRIB extensions (`.grib`, `.grib2`, `.grb`, `.grb2`), excluding cfgrib `.idx` sidecars. GRIB fields are regridded across the full monthly time sequence in batches instead of repeating interpolation separately for every timestamp. cfgrib uses a persistent index cache; if an index is empty or fails to open, it rebuilds into a separate persistent index. Missing ERA5-Land fields in older archives are reported and filled with neutral defaults; retraining with land fields is recommended to learn land-air interactions. Dataset ingestion, epoch progress, and training-batch progress are logged.
+
+If the script cannot produce a finite validation candidate or lacks enough training/holdout cases for a month, it reports that month as incomplete. Review fallback status and per-lead metrics before relying on a calibration that missed its configured limits.
 
 ### 4. Synthetic Verification Run
 Omit `--grib` or pass an unlocated file path to test execution on standalone systems:
