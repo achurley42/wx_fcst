@@ -19,6 +19,9 @@ from model_architecture import (
     WeatherSpatioTemporalUNet,
 )
 from forecast_engine import run_hourly_72hr_forecast, export_hourly_deliverables
+from forecast_dashboard import write_forecast_dashboard
+from operational_archive import latest_operational_archive, operational_archive_path
+from airport_meteograms import export_airport_meteograms, validate_airport_csv
 
 
 def retrieve_cds_operational_analysis(bbox, target_date_utc, output_path):
@@ -175,7 +178,16 @@ def existing_cds_data_matches_time(grib_path, target_time_utc):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Standalone Hybrid GPU/CPU 72-Hour Hourly AI Weather Model")
-    parser.add_argument("--grib", type=str, default="input_analysis.grib2", help="Path to input GRIB2 file")
+    parser.add_argument(
+        "--grib",
+        type=str,
+        default=None,
+        help=(
+            "Path to input GRIB2 file. With --use-cds, defaults to a "
+            "bounds/date-named file under ./input_data; otherwise uses the "
+            "latest matching archive there."
+        ),
+    )
     parser.add_argument("--use-cds", action="store_true", help="Automatically pull operational T0 analysis via CDS API")
     parser.add_argument("--cds-date", type=str, default=None, help="Target UTC date for CDS pull (YYYY-MM-DD-HH). Defaults to 6 days ago (ERA5 release buffer)")
     parser.add_argument("--lat-min", type=float, required=True, help="Minimum Latitude")
@@ -194,11 +206,24 @@ def parse_args():
     parser.add_argument("--force-cpu", action="store_true", help="Force execution on CPU")
     parser.add_argument("--skip-dep-check", action="store_true", help="Bypass pre-flight dependency checker")
     parser.add_argument("--outdir", type=str, default="./forecast_output", help="Output directory")
+    parser.add_argument(
+        "--airports",
+        type=str,
+        default=None,
+        help=(
+            "Optional airport CSV (icao,name,latitude,longitude) for "
+            "bilinearly interpolated per-airport meteograms."
+        ),
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.airports:
+        airport_count = validate_airport_csv(args.airports)
+        print(f"[AIRPORT] Validated {airport_count} airport(s) from {args.airports}.")
+    run_started_at = datetime.now(timezone.utc)
     bbox = {
         "lat_min": args.lat_min,
         "lat_max": args.lat_max,
@@ -214,6 +239,8 @@ def main():
             # ERA5 full reanalysis typically has a 5-day release buffer
             target_time = (datetime.now(timezone.utc) - timedelta(days=6)).replace(minute=0, second=0, microsecond=0)
 
+        if args.grib is None:
+            args.grib = operational_archive_path("./input_data", bbox, target_time)
         os.makedirs(os.path.dirname(os.path.abspath(args.grib)), exist_ok=True)
         if existing_cds_data_matches_time(args.grib, target_time):
             print(
@@ -222,6 +249,14 @@ def main():
             )
         else:
             retrieve_cds_operational_analysis(bbox, target_time, args.grib)
+    elif args.grib is None:
+        args.grib = latest_operational_archive("./input_data", bbox)
+        if args.grib is None:
+            raise FileNotFoundError(
+                "No bounds-qualified operational GRIB was found under "
+                "./input_data. Specify --grib PATH or use --use-cds to "
+                "download the analysis."
+            )
 
     print("=" * 70)
     print("  AIR FORCE STANDALONE REGIONAL AI WEATHER MODEL (HOURLY ROLLOUT)")
@@ -237,19 +272,24 @@ def main():
     model = WeatherSpatioTemporalUNet(in_channels=MODEL_INPUT_CHANNELS, out_channels=6)
     init_time = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     weights_path = args.weights
+    weights_source = "explicit --weights argument" if args.weights else None
+    calibration = None
+    calibration_overlap = None
     if weights_path is None:
         match = find_compatible_calibration(
             args.calibration_registry, bbox, init_time.month, minimum_overlap=0.5
         )
         if match:
-            calibration, overlap = match
+            calibration, calibration_overlap = match
             weights_path = calibration["weights_path"]
+            weights_source = "monthly calibration registry"
             print(
                 f"[MODEL] Reusing {init_time.strftime('%B')} calibration from "
-                f"{calibration['bbox']} (region overlap {overlap:.0%}, "
+                f"{calibration['bbox']} (region overlap {calibration_overlap:.0%}, "
                 f"status={calibration.get('status', 'accepted')}): {weights_path}"
             )
         else:
+            weights_source = "baseline (no matching calibration)"
             print(
                 f"[MODEL] No {init_time.strftime('%B')} calibration overlaps this "
                 "region by at least 50%; "
@@ -276,6 +316,96 @@ def main():
         output_dir=args.outdir,
         plot_interval=args.plot_interval
     )
+    airport_meteogram_files = []
+    if args.airports:
+        airport_meteogram_files = export_airport_meteograms(
+            os.path.join(args.outdir, "forecast_72hr_surface_master.nc"),
+            args.airports,
+        )
+    effective_weights_path = (
+        os.path.abspath(weights_path)
+        if weights_path and os.path.isfile(weights_path)
+        else None
+    )
+    if args.weights and effective_weights_path is None:
+        weights_source = "baseline (requested checkpoint was not found)"
+    input_grib_path = os.path.abspath(args.grib)
+    input_grib_size = (
+        os.path.getsize(input_grib_path) if os.path.isfile(input_grib_path) else None
+    )
+    if input_grib_size is None:
+        input_grib_status = "Missing; synthetic grid fallback was used"
+    else:
+        input_grib_status = (
+            "Present; an unreadable GRIB can trigger the synthetic-grid fallback"
+        )
+    metadata = {
+        "run_started_utc": run_started_at.isoformat(timespec="seconds"),
+        "forecast_initialization_utc": init_time.isoformat(timespec="seconds"),
+        "forecast_valid_start_utc": valid_times[0].isoformat(timespec="minutes"),
+        "forecast_valid_end_utc": valid_times[-1].isoformat(timespec="minutes"),
+        "forecast_duration_hours": 72,
+        "timestep_hours": 1,
+        "forecast_states": len(valid_times),
+        "source_data_mode": "CDS download/reuse" if args.use_cds else "local GRIB",
+        "input_grib_file": input_grib_path,
+        "input_grib_status": input_grib_status,
+        "input_grib_size_bytes": input_grib_size,
+        "requested_area": (
+            f"Lat {bbox['lat_min']} to {bbox['lat_max']}, "
+            f"lon {bbox['lon_min']} to {bbox['lon_max']}"
+        ),
+        "grid_area": (
+            f"Lat {float(lats[0]):.6g} to {float(lats[-1]):.6g}, "
+            f"lon {float(lons[0]):.6g} to {float(lons[-1]):.6g}"
+        ),
+        "grid_shape_lat_lon": f"{len(lats)} x {len(lons)}",
+        "requested_resolution_degrees": args.res,
+        "approximate_resolution_km": round(args.res * 111.0, 2),
+        "model_architecture": "WeatherSpatioTemporalUNet",
+        "model_mode": (
+            "Fine-tuned model" if effective_weights_path else "Hybrid baseline (no trained checkpoint)"
+        ),
+        "model_input_channels": MODEL_INPUT_CHANNELS,
+        "model_output_channels": 6,
+        "weights_source": weights_source,
+        "weights_requested_path": os.path.abspath(args.weights) if args.weights else "not specified",
+        "weights_loaded_from": effective_weights_path or "None; baseline weights used",
+        "calibration_status": (
+            calibration.get("status", "accepted") if calibration else "not applicable"
+        ),
+        "calibration_month": calibration.get("month") if calibration else None,
+        "calibration_region": (
+            str(calibration.get("bbox")) if calibration else "not applicable"
+        ),
+        "calibration_validation_score": (
+            calibration.get("validation_score") if calibration else None
+        ),
+        "calibration_region_overlap": (
+            f"{calibration_overlap:.0%}" if calibration_overlap is not None else "not applicable"
+        ),
+        "compute_device": str(compute_mgr.device),
+        "forced_cpu": args.force_cpu,
+        "chart_interval_hours": args.plot_interval,
+        "airport_list_csv": (
+            os.path.abspath(args.airports) if args.airports else "not specified"
+        ),
+        "airport_meteogram_count": len(airport_meteogram_files),
+        "output_directory": os.path.abspath(args.outdir),
+    }
+    dashboard_path, metadata_path = write_forecast_dashboard(
+        output_dir=args.outdir,
+        metadata=metadata,
+        inventory_root=os.path.dirname(os.path.abspath(__file__)),
+        extra_files=(
+            input_grib_path,
+            effective_weights_path,
+            args.calibration_registry,
+            args.airports,
+        ),
+    )
+    print(f"[EXPORT] Forecast dashboard: {dashboard_path}")
+    print(f"[EXPORT] Forecast metadata: {metadata_path}")
     print("=" * 70)
     print(f"[COMPLETE] All hourly forecast deliverables written to: {args.outdir}")
 

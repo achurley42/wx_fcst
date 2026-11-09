@@ -3,6 +3,7 @@ import os
 import argparse
 from datetime import datetime, timedelta, timezone
 import cdsapi
+from operational_archive import operational_archive_path
 
 def download_operational_analysis(bbox, target_date_utc, output_file):
     """
@@ -18,10 +19,11 @@ def download_operational_analysis(bbox, target_date_utc, output_file):
     month = f"{target_date_utc.month:02d}"
     day = f"{target_date_utc.day:02d}"
     time_str = f"{target_date_utc.hour:02d}:00"
-    
-    temp_sfc = "temp_sfc.grib"
-    temp_pl = "temp_pl.grib"
-    temp_land = "temp_land.grib"
+    output_dir = os.path.dirname(os.path.abspath(output_file))
+    os.makedirs(output_dir, exist_ok=True)
+    temp_sfc = output_file + ".sfc.tmp"
+    temp_pl = output_file + ".pl.tmp"
+    temp_land = output_file + ".land.tmp"
 
     print("=" * 70)
     print("  OPERATIONAL ERA5 DATA RETRIEVAL (CDS API)")
@@ -122,7 +124,14 @@ if __name__ == "__main__":
     parser.add_argument("--lat-max", type=float, required=True, help="North latitude")
     parser.add_argument("--lon-min", type=float, required=True, help="West longitude")
     parser.add_argument("--lon-max", type=float, required=True, help="East longitude")
-    parser.add_argument("--output", type=str, default="./current_analysis.grib2", help="Output path")
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help=(
+            "Output path. Defaults to ./input_data/era5_analysis_<bounds>_<date>.grib2."
+        ),
+    )
     parser.add_argument("--date", type=str, default=None, help="Date in YYYY-MM-DD-HH format (defaults to 5 days ago to match ERA5 latency)")
     args = parser.parse_args()
 
@@ -138,4 +147,7 @@ if __name__ == "__main__":
         "lon_min": args.lon_min,
         "lon_max": args.lon_max
     }
-    download_operational_analysis(bbox, t_target, args.output)
+    output_path = args.output or operational_archive_path(
+        "./input_data", bbox, t_target
+    )
+    download_operational_analysis(bbox, t_target, output_path)

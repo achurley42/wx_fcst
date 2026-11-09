@@ -68,6 +68,7 @@ The architecture employs a **Physics-Guided Neural Hybrid Architecture**: it run
 |  2. forecast_72hr_surface_master.nc     : Consolidated 73-step 4D cube   |
 |  3. aor_center_point_forecast_hourly.csv: 73-row point meteogram         |
 |  4. surface_prog_T+XXh.png              : 4-Panel diagnostic charts      |
+|  5. forecast_dashboard.html             : Run dashboard and file inventory |
 +--------------------------------------------------------------------------+
 ```
 
@@ -83,6 +84,7 @@ The architecture employs a **Physics-Guided Neural Hybrid Architecture**: it run
 ├── run_forecast.py             # Operational CLI entrypoint supporting hourly outputs
 ├── train_unet.py               # Model training and fine-tuning script
 ├── historical_grib2/           # Historical GRIB2 files for model fine-tuning
+├── input_data/                 # Operational GRIB analyses, named by bounds and UTC time
 ├── checkpoints/                # Saved PyTorch model weights (.pt files)
 └── forecast_output/            # Generated products directory
     ├── hourly_nc/              # Individual hourly NetCDF4 files (T+00h to T+72h)
@@ -91,8 +93,25 @@ The architecture employs a **Physics-Guided Neural Hybrid Architecture**: it run
     │   └── ...
     ├── forecast_72hr_surface_master.nc # Unified 73-hour NetCDF cube
     ├── aor_center_point_forecast_hourly.csv # Full 73-step operational meteogram
-    └── surface_prog_T+XXh.png          # 4-Panel prognostic charts (configurable interval)
+    ├── surface_prog_T+XXh.png          # 4-Panel prognostic charts (configurable interval)
+    ├── forecast_dashboard.html         # Run metadata, chart slider, and file inventory
+    ├── forecast_metadata.json          # Machine-readable run metadata
+    └── airport_meteograms/             # Optional per-airport hourly CSVs
 ```
+
+After a forecast completes, open `forecast_dashboard.html` in the output directory in a web browser. It displays the selected model mode and weights, initialization and valid times, area and grid, resolution, timestep, compute device, and a slider for the generated charts. The searchable inventory includes project and forecast-output files, plus any input GRIB or checkpoint files used by the run. The dashboard is a standalone HTML file and does not require a web server.
+
+To regenerate a dashboard for an earlier run, without rerunning the forecast, use the same Python environment as the forecast:
+
+```bash
+python3 forecast_dashboard.py \
+  --output-dir ./forecast_output \
+  --inventory-root .
+```
+
+If that run predates `forecast_metadata.json`, the script reads available time and grid details from the forecast NetCDF files and marks original model/run settings as not recorded. You can optionally include the input and checkpoint in the inventory with `--input-grib` and `--weights`. Set `--forecast-init` only if you need to supply an initialization time not present in the NetCDF output.
+
+Operational GRIB analyses are stored in `./input_data` by default, using filenames with requested bounds and UTC date/time, such as `era5_analysis_lat25_35_lon-90_-80_2026_11_03_11.grib2`. `--use-cds` derives the path from the CDS target time; otherwise, when `--grib` is omitted, the forecast runner selects the latest matching archive. cfgrib creates the `.idx` cache automatically on first open and rebuilds it when stale or invalid; renaming an archive gives the index a new path and it is created again on first open.
 
 ---
 
@@ -593,6 +612,17 @@ When the hourly forecast completes, the following files are produced in `--outdi
 
 4. **Surface Prognostic Charts (`surface_prog_T+XXh.png`):**
    - Generated at intervals determined by `--plot-interval` (default every 6 hours, plus 24h, 48h, and 72h milestones). Set `--plot-interval 1` if you require PNG charts for every single hour.
+
+5. **Airport Meteograms (`airport_meteograms/<ICAO>_<init>_meteogram.csv`):**
+   - Provide an airport CSV with `icao,name,latitude,longitude` columns and pass it to `run_forecast.py` with `--airports ./airports.csv` to generate one CSV per in-grid airport.
+   - Each airport time series uses bilinear interpolation from the master NetCDF and contains temperature, dewpoint, wind speed/direction, mean sea-level pressure, and one-hour precipitation. Airports outside the grid are skipped with a warning.
+   - To generate these files after an earlier forecast has already produced its NetCDF:
+
+     ```bash
+     python3 airport_meteograms.py \
+       --netcdf ./forecast_output/forecast_72hr_surface_master.nc \
+       --airports ./airports.csv
+     ```
 
 ---
 

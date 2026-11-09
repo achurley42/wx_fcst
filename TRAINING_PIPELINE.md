@@ -71,6 +71,8 @@ Each monthly archive is processed independently:
 
 The default cache directory is `~/.cache/wx_fcst/regrid`; `--cache-dir` overrides it. Cache files are kept outside the GRIB directory by default. A rerun reuses completed archive caches and rebuilds cache entries that are absent, mismatched, or structurally invalid. Changing source size or modification time, bounds, resolution, or channel schema results in a different cache key. The key does not hash every source-file byte.
 
+cfgrib also maintains its own `.idx` message index beside each GRIB. It creates that index on first open, reuses it on later opens, and rebuilds it when it is invalid or stale. The operational ingestion path retries with a separate persistent index if the default index is empty or cannot be opened. Renaming a GRIB changes its index path; opening the renamed file creates a new index automatically. The `.idx` file is a disposable performance cache, not training data.
+
 Regridding can still take a long time on a cache miss. The cache only saves work after an archive has successfully been opened and regridded at least once.
 
 ## 4. Training sample construction
