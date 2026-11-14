@@ -149,8 +149,8 @@ def _parse_args():
     )
     parser.add_argument(
         "--output-dir",
-        default="./forecast_output",
-        help="Existing forecast output directory (default: ./forecast_output).",
+        default="./daily_forecast",
+        help="Existing forecast output directory (default: ./daily_forecast).",
     )
     parser.add_argument(
         "--inventory-root",

@@ -205,7 +205,7 @@ def parse_args():
     parser.add_argument("--plot-interval", type=int, default=1, help="Interval in hours for prognostic charts (e.g. 1, 6, 12)")
     parser.add_argument("--force-cpu", action="store_true", help="Force execution on CPU")
     parser.add_argument("--skip-dep-check", action="store_true", help="Bypass pre-flight dependency checker")
-    parser.add_argument("--outdir", type=str, default="./forecast_output", help="Output directory")
+    parser.add_argument("--outdir", type=str, default="./daily_forecast", help="Output directory")
     parser.add_argument(
         "--airports",
         type=str,

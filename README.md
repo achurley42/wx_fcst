@@ -86,7 +86,7 @@ The architecture employs a **Physics-Guided Neural Hybrid Architecture**: it run
 ├── historical_grib2/           # Historical GRIB2 files for model fine-tuning
 ├── input_data/                 # Operational GRIB analyses, named by bounds and UTC time
 ├── checkpoints/                # Saved PyTorch model weights (.pt files)
-└── forecast_output/            # Generated products directory
+└── daily_forecast/             # Generated products directory
     ├── hourly_nc/              # Individual hourly NetCDF4 files (T+00h to T+72h)
     │   ├── forecast_surface_T+00h.nc
     │   ├── forecast_surface_T+01h.nc
@@ -105,7 +105,7 @@ To regenerate a dashboard for an earlier run, without rerunning the forecast, us
 
 ```bash
 python3 forecast_dashboard.py \
-  --output-dir ./forecast_output \
+  --output-dir ./daily_forecast \
   --inventory-root .
 ```
 
@@ -170,7 +170,7 @@ python3 run_forecast.py \
   --lon-min -90.0 \
   --lon-max -80.0 \
   --res 0.05 \
-  --outdir ./forecast_output
+  --outdir ./daily_forecast
 ```
 
 ### 2. Fine-Tuned Model Inference
@@ -186,7 +186,7 @@ python3 run_forecast.py \
   --res 0.05 \
   --weights ./checkpoints/regional_unet_best.pt \
   --plot-interval 6 \
-  --outdir ./forecast_output
+  --outdir ./daily_forecast
 ```
 
 ### 3. Historical Monthly Calibration
@@ -527,7 +527,7 @@ def parse_args():
     parser.add_argument("--weights", type=str, default=None, help="Optional path to fine-tuned .pt weights")
     parser.add_argument("--plot-interval", type=int, default=6, help="Interval in hours for prognostic charts (e.g. 1, 6, 12)")
     parser.add_argument("--force-cpu", action="store_true", help="Force execution on CPU")
-    parser.add_argument("--outdir", type=str, default="./forecast_output", help="Output directory")
+    parser.add_argument("--outdir", type=str, default="./daily_forecast", help="Output directory")
     return parser.parse_args()
 
 
@@ -620,7 +620,7 @@ When the hourly forecast completes, the following files are produced in `--outdi
 
      ```bash
      python3 airport_meteograms.py \
-       --netcdf ./forecast_output/forecast_72hr_surface_master.nc \
+       --netcdf ./daily_forecast/forecast_72hr_surface_master.nc \
        --airports ./airports.csv
      ```
 

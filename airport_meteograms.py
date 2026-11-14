@@ -258,7 +258,7 @@ def main():
     )
     parser.add_argument(
         "--netcdf",
-        default="./forecast_output/forecast_72hr_surface_master.nc",
+        default="./daily_forecast/forecast_72hr_surface_master.nc",
         help="Path to forecast_72hr_surface_master.nc.",
     )
     parser.add_argument(
